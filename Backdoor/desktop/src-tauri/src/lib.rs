@@ -147,13 +147,13 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
     if temperature.abs() > 0.01 {
         filters.push(format!("colorbalance=rs={temperature:.4}:bs={:.4}", -temperature));
     }
-    for (key, wheel) in [("shadows", "s"), ("tint", "m"), ("highlights", "h")] {
-        if let Some(wheel) = colors["grading"][key].as_object() {
-            let amount = wheel.get("amount").and_then(Value::as_f64).unwrap_or(0.0) / 100.0 * 0.3;
-            let angle = wheel.get("hue").and_then(Value::as_f64).unwrap_or(0.0).to_radians();
+    for (key, wheel_channel) in [("shadows", "s"), ("tint", "m"), ("highlights", "h")] {
+        if let Some(wheel_data) = colors["grading"][key].as_object() {
+            let amount = wheel_data.get("amount").and_then(Value::as_f64).unwrap_or(0.0) / 100.0 * 0.3;
+            let angle = wheel_data.get("hue").and_then(Value::as_f64).unwrap_or(0.0).to_radians();
             if amount.abs() > 0.001 {
                 let r = amount * angle.cos(); let b = amount * angle.sin();
-                filters.push(format!("colorbalance=r{wheel}={r:.4}:b{wheel}={b:.4}"));
+                filters.push(format!("colorbalance=r{wheel_channel}={r:.4}:b{wheel_channel}={b:.4}"));
             }
         }
     }
@@ -422,8 +422,10 @@ fn render_timeline(app: tauri::AppHandle, process: SharedExport, clips: Vec<Valu
         let end = start + length;
         let next_transition = clips.iter().find(|other| other["id"] != clip["id"] && other["track"] == clip["track"]
             && (n(other, "start", 0.0) - end).abs() < 0.05
-            && other["path"].as_str().is_some()).and_then(|_| clip["trans"].as_object())
-            .map(|trans| (trans["type"].as_str().unwrap_or("dissolve"), n(trans, "dur", 1.0)));
+            && other["path"].as_str().is_some()).and_then(|_| {
+                let trans = &clip["trans"];
+                trans.is_object().then(|| (trans["type"].as_str().unwrap_or("dissolve"), n(trans, "dur", 1.0)))
+            });
         let (filters, x, y) = video_filters(clip, width, height, start, length, previous_transition, next_transition);
         let raw = format!("visualraw{index}");
         let out = format!("visual{index}");
