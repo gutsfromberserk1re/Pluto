@@ -30,14 +30,24 @@ jobs:
         working-directory: Backdoor
 
   tauri-windows:
-    name: Tauri Windows build
+    name: Portable Windows preview build
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Restore cached FFmpeg tools
+        id: ffmpeg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: Backdoor/desktop/src-tauri/ffmpeg
+          # Bump v1 when you want this job to fetch a newer Chocolatey FFmpeg package.
+          key: ffmpeg-windows-x64-chocolatey-v1
       - name: Install FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: choco install ffmpeg --yes --no-progress
       - name: Stage FFmpeg for the desktop bundle
+        id: ffmpeg-stage
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ffmpegBundle = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/desktop/src-tauri/ffmpeg'
@@ -47,23 +57,43 @@ jobs:
           if (-not $ffmpegExe -or -not $ffprobeExe) { throw 'FFmpeg executables were not found after installation.' }
           Copy-Item $ffmpegExe.FullName $ffmpegBundle
           Copy-Item $ffprobeExe.FullName $ffmpegBundle
+          @($ffmpegExe.Directory.FullName, $ffprobeExe.Directory.FullName) | Select-Object -Unique | ForEach-Object {
+            Get-ChildItem $_ -Filter '*.dll' | Copy-Item -Destination $ffmpegBundle
+          }
+      - name: Save FFmpeg cache
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true' && steps.ffmpeg-stage.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: Backdoor/desktop/src-tauri/ffmpeg
+          key: ffmpeg-windows-x64-chocolatey-v1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: Backdoor -> target
       - run: cargo build -p pluto-desktop --release
         working-directory: Backdoor
-      - name: Stage FFmpeg beside the executable
+      - name: Assemble portable preview ZIP
         shell: pwsh
         run: |
-          $runtimeFfmpeg = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/target/release/ffmpeg'
+          $packageRoot = Join-Path $env:RUNNER_TEMP 'Pluto-Portable-Windows'
+          $runtimeFfmpeg = Join-Path $packageRoot 'ffmpeg'
+          $releaseExe = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/target/release/pluto-desktop.exe'
+          $portableExe = Join-Path $packageRoot 'Pluto.exe'
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/target/release/Pluto-Portable-Windows.zip'
           New-Item -ItemType Directory -Force -Path $runtimeFfmpeg | Out-Null
+          Copy-Item $releaseExe $portableExe
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'Backdoor/desktop/src-tauri/ffmpeg/ffmpeg.exe') $runtimeFfmpeg
           Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'Backdoor/desktop/src-tauri/ffmpeg/ffprobe.exe') $runtimeFfmpeg
+          Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE 'Backdoor/desktop/src-tauri/ffmpeg') -Filter '*.dll' | Copy-Item -Destination $runtimeFfmpeg
+          @(
+            'Pluto portable preview'
+            ''
+            'Unzip the archive and run Pluto.exe. Keep the ffmpeg folder beside Pluto.exe.'
+            'This preview uses the installed Microsoft Edge WebView2 Runtime.'
+          ) | Set-Content -Path (Join-Path $packageRoot 'README.txt') -Encoding utf8
+          Compress-Archive -Path (Join-Path $packageRoot '*') -DestinationPath $zipPath -Force
       - uses: actions/upload-artifact@v4
         with:
-          name: Pluto-Windows
+          name: Pluto-Portable-Windows
           if-no-files-found: error
-          path: |
-            Backdoor/target/release/pluto-desktop.exe
-            Backdoor/target/release/ffmpeg/**
+          path: Backdoor/target/release/Pluto-Portable-Windows.zip
