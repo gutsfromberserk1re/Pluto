@@ -1,0 +1,69 @@
+name: Rust and Tauri
+
+on:
+  push:
+    paths:
+      - "Backdoor/**"
+      - "Frontdoor/**"
+      - ".github/workflows/rust-tauri.yml"
+  pull_request:
+    paths:
+      - "Backdoor/**"
+      - "Frontdoor/**"
+      - ".github/workflows/rust-tauri.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  timeline-core:
+    name: Timeline core checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Backdoor -> target
+      - run: cargo check -p pluto-timeline-core
+        working-directory: Backdoor
+
+  tauri-windows:
+    name: Tauri Windows build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg
+        shell: pwsh
+        run: choco install ffmpeg --yes --no-progress
+      - name: Stage FFmpeg for the desktop bundle
+        shell: pwsh
+        run: |
+          $ffmpegBundle = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/desktop/src-tauri/ffmpeg'
+          New-Item -ItemType Directory -Force -Path $ffmpegBundle | Out-Null
+          $ffmpegExe = Get-ChildItem (Join-Path $env:ChocolateyInstall 'lib/ffmpeg') -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          $ffprobeExe = Get-ChildItem (Join-Path $env:ChocolateyInstall 'lib/ffmpeg') -Filter ffprobe.exe -Recurse | Select-Object -First 1
+          if (-not $ffmpegExe -or -not $ffprobeExe) { throw 'FFmpeg executables were not found after installation.' }
+          Copy-Item $ffmpegExe.FullName $ffmpegBundle
+          Copy-Item $ffprobeExe.FullName $ffmpegBundle
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Backdoor -> target
+      - run: cargo build -p pluto-desktop --release
+        working-directory: Backdoor
+      - name: Stage FFmpeg beside the executable
+        shell: pwsh
+        run: |
+          $runtimeFfmpeg = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/target/release/ffmpeg'
+          New-Item -ItemType Directory -Force -Path $runtimeFfmpeg | Out-Null
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'Backdoor/desktop/src-tauri/ffmpeg/ffmpeg.exe') $runtimeFfmpeg
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'Backdoor/desktop/src-tauri/ffmpeg/ffprobe.exe') $runtimeFfmpeg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Pluto-Windows
+          if-no-files-found: error
+          path: |
+            Backdoor/target/release/pluto-desktop.exe
+            Backdoor/target/release/ffmpeg/**
