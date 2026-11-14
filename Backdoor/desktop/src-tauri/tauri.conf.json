@@ -28,6 +28,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "icon": ["icons/icon.ico"],
     "resources": {
       "ffmpeg/ffmpeg.exe": "ffmpeg/ffmpeg.exe",
       "ffmpeg/ffprobe.exe": "ffmpeg/ffprobe.exe"
