@@ -29,6 +29,9 @@ const ICONS = {
   video: '<rect x="3" y="6" width="13" height="12" rx="2"/><path d="m16 10 5-3v10l-5-3z"/>',
   check: '<path d="m5 12 5 5 9-10"/>',
   x: '<path d="M6 6l12 12M18 6 6 18"/>',
+  windowMinimize: '<path d="M5 12h14"/>',
+  windowMaximize: '<rect x="5" y="5" width="14" height="14" rx="1"/>',
+  windowRestore: '<rect x="7" y="4" width="12" height="12" rx="1"/><path d="M5 8v12h12"/>',
   play: '<path d="M8 5.2v13.6a.6.6 0 0 0 .9.5l11-6.8a.6.6 0 0 0 0-1l-11-6.8a.6.6 0 0 0-.9.5z" fill="currentColor"/>',
   pause: '<rect x="6.5" y="5" width="3.8" height="14" rx="1" fill="currentColor"/><rect x="13.7" y="5" width="3.8" height="14" rx="1" fill="currentColor"/>',
   skipBack: '<path d="M19 5.5v13L9.5 12z"/><path d="M5 5v14"/>',
@@ -123,6 +126,34 @@ function createNumberField({
     if (emit && changed) onChange?.(v);
   };
   const nudge = (dir, big) => apply(v + dir * step * (big ? 10 : 1));
+
+  input.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || e.pointerType === "touch") return;
+    const startX = e.clientX, startValue = v;
+    let scrubbing = false;
+    const move = (ev) => {
+      const distance = ev.clientX - startX;
+      if (!scrubbing && Math.abs(distance) < 4) return;
+      if (!scrubbing) {
+        scrubbing = true;
+        input.classList.add("is-scrubbing");
+        input.blur();
+        window.getSelection?.()?.removeAllRanges();
+      }
+      ev.preventDefault();
+      const multiplier = ev.shiftKey ? 5 : ev.altKey ? 0.2 : 1;
+      apply(startValue + Math.round(distance / 2) * step * multiplier);
+    };
+    const end = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      input.classList.remove("is-scrubbing");
+    };
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", end, { once: true });
+    window.addEventListener("pointercancel", end, { once: true });
+  });
 
   input.addEventListener("keydown", (e) => {
     if (e.key === "ArrowUp") { e.preventDefault(); nudge(1, e.shiftKey); }
@@ -251,7 +282,7 @@ function createQuad({ fields, pairs, layout = "cross", linked = false, label = "
   };
 }
 
-function createRotationRuler({ min = -45, max = 45, value = 0, snap = 0.75, ticks = 36, onInput } = {}) {
+function createRotationRuler({ min = -180, max = 180, value = 0, snap = 0.75, ticks = 36, onInput } = {}) {
   const span = max - min;
   let target = value, shown = value, dragging = false, raf = 0, last = 0;
   const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
@@ -264,7 +295,7 @@ function createRotationRuler({ min = -45, max = 45, value = 0, snap = 0.75, tick
     t.style.left = (i / ticks) * 100 + "%";
     tickEls.push(t);
   }
-  const labelEls = [0, 0.25, 0.75, 1].map((p) => {
+  const labelEls = [0, 0.25, 0.5, 0.75, 1].map((p) => {
     const l = h("span", { class: "tp-ruler__label" }, fmt(min + p * span) + "°");
     l.style.left = p * 100 + "%";
     return l;
@@ -352,7 +383,7 @@ const DEFAULT_STATE = {
 const DEFAULT_LIMITS = {
   scale: { min: 1, max: 1000, step: 1, decimals: 1 },
   position: { min: -10000, max: 10000, step: 1, decimals: 0 },
-  rotation: { min: -45, max: 45, step: 0.5, decimals: 1 },
+  rotation: { min: -180, max: 180, step: 0.5, decimals: 1 },
   opacity: { min: 0, max: 100, step: 1, decimals: 0 },
   crop: { min: 0, max: 10000, step: 1, decimals: 0 },
   distort: { min: -1000, max: 1000, step: 1, decimals: 0 },
@@ -615,15 +646,16 @@ function createSlider(opts) {
   }
 
   const valueAt = (e) => {
-    const r = area.getBoundingClientRect();
-    const n = min + clamp((e.clientX - r.left) / r.width, 0, 1) * span;
+    const r = hit.getBoundingClientRect();
+    const n = min + clamp((e.clientX - r.left - 9) / Math.max(1, r.width - 18), 0, 1) * span;
     return Math.abs(n - def) <= span * 0.012 ? def : n;
   };
   let dragging = false;
   hit.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
+    e.preventDefault();
     dragging = true;
-    hit.setPointerCapture(e.pointerId);
+    try { hit.setPointerCapture(e.pointerId); } catch { /* Pointer capture is not available in every preview host. */ }
     el.classList.add("is-dragging");
     apply(valueAt(e), true);
   });
@@ -1844,10 +1876,41 @@ function createVideoEditor(mount, options = {}) {
   const nameInput = h("input", { class: "ed-name", type: "text", spellcheck: "false", "aria-label": "Project name", maxlength: "60" });
   nameInput.value = projectName;
   const exportBtn = h("button", { class: "ed-export", type: "button" }, icon("download", 20), "Export");
-  const logo = h("div", { class: "ed-logo", "aria-hidden": "true" }, icon("film", 20));
+  const logo = h("img", { class: "ed-logo", src: "./assets/pluto-icon.ico", alt: "" });
+  const windowApi = window.__TAURI__?.window?.getCurrentWindow?.();
+  const callWindow = (method) => {
+    if (!windowApi || typeof windowApi[method] !== "function") return Promise.resolve();
+    try {
+      return Promise.resolve(windowApi[method]()).catch((error) => root.dispatchEvent(new CustomEvent("pluto:backend-error", { detail: String(error) })));
+    } catch (error) {
+      root.dispatchEvent(new CustomEvent("pluto:backend-error", { detail: String(error) }));
+      return Promise.resolve();
+    }
+  };
+  const minimizeBtn = btn("windowMinimize", "Minimize window", "ed-window-btn");
+  const maximizeBtn = btn("windowMaximize", "Maximize window", "ed-window-btn");
+  const closeWindowBtn = btn("x", "Close window", "ed-window-btn ed-window-btn--close");
+  const windowControls = h("div", { class: "ed-window-controls", "aria-label": "Window controls" }, minimizeBtn, maximizeBtn, closeWindowBtn);
+  windowControls.hidden = !windowApi;
+  const updateMaximizeButton = async () => {
+    if (!windowApi?.isMaximized) return;
+    try {
+      const maximized = await windowApi.isMaximized();
+      maximizeBtn.replaceChildren(icon(maximized ? "windowRestore" : "windowMaximize", 16));
+      maximizeBtn.setAttribute("aria-label", maximized ? "Restore window" : "Maximize window");
+      maximizeBtn.title = maximized ? "Restore window" : "Maximize window";
+    } catch { /* Window state is unavailable in browser-only previews. */ }
+  };
+  minimizeBtn.addEventListener("click", () => callWindow("minimize"));
+  maximizeBtn.addEventListener("click", () => callWindow("toggleMaximize").then(updateMaximizeButton));
+  closeWindowBtn.addEventListener("click", () => callWindow("close"));
+  updateMaximizeButton();
+  const titleDrag = h("span", { class: "ed-top__drag", "data-tauri-drag-region": true, "aria-hidden": "true" });
+  titleDrag.addEventListener("dblclick", () => callWindow("toggleMaximize").then(updateMaximizeButton));
+  const topActions = h("div", { class: "ed-top__actions" }, undoBtn, redoBtn, exportBtn);
   const top = h("header", { class: "ed-card ed-top" },
-    logo, h("span", { class: "ed-brand" }, "Reel"), h("span", { class: "ed-sep" }), nameInput,
-    h("span", { class: "ed-spacer" }), undoBtn, redoBtn, exportBtn);
+    logo, h("span", { class: "ed-brand", "data-tauri-drag-region": true }, "Pluto"), h("span", { class: "ed-sep", "data-tauri-drag-region": true }), nameInput,
+    titleDrag, topActions, windowControls);
 
   /* Left Panel: Media and Audio tabs */
   const mediaContent = h("div", { class: "ed-media__content" });
@@ -1879,7 +1942,7 @@ function createVideoEditor(mount, options = {}) {
         h("div", { class: "ed-media__thumb" }, h("span", { class: "ed-media__dur" }, fmtMS(m.dur)), add),
         h("span", { class: "ed-media__name" }, m.label));
       tile.firstChild.style.background = themeGradient(th);
-      if (m.thumbnail) tile.firstChild.style.backgroundImage = `url("${m.thumbnail}")`;
+      if (m.thumbnail || (m.kind === "image" && m.previewUrl)) tile.firstChild.style.backgroundImage = `url("${m.thumbnail || m.previewUrl}")`;
       add.addEventListener("click", () => addClip(m));
       tile.addEventListener("dblclick", () => addClip(m));
       tile.addEventListener("keydown", (event) => {
@@ -1911,7 +1974,8 @@ function createVideoEditor(mount, options = {}) {
     try {
       const asset = await window.plutoNative.importMedia();
       if (!asset) return;
-      mediaItems.push({ ...asset, dur: asset.duration, label: asset.name, theme: asset.kind === "audio" ? "audio" : "coast", previewUrl: window.plutoNative.convertFileSrc(asset.path) });
+      const previewUrl = window.plutoNative.convertFileSrc(asset.path);
+      mediaItems.push({ ...asset, dur: asset.duration, label: asset.name, theme: asset.kind === "audio" ? "audio" : "coast", previewUrl, thumbnail: asset.thumbnail || (asset.kind === "image" ? previewUrl : null) });
       renderMedia();
     } catch (error) {
       mediaEmpty.hidden = false; mediaEmpty.textContent = `Import failed: ${error}`;
@@ -2263,7 +2327,8 @@ function createVideoEditor(mount, options = {}) {
       if (!n) { n = makeLayer(c); layerNodes.set(c.id, n); frame.insertBefore(n.layer, gridEl); }
       n.layer.style.zIndex = i + 1;
       applyLayer(n, c, Math.max(0, time - c.start));
-      n.warp.style.opacity = f.op * c.props.transform.opacity / 100; n.warp.style.clipPath = f.clip;
+      const opacity = clamp(Number(c.props.transform?.opacity ?? 100) / 100, 0, 1);
+      n.warp.style.opacity = String(f.op * opacity); n.warp.style.clipPath = f.clip;
     });
     syncAudioPreview();
     const s = sel();
@@ -2423,9 +2488,24 @@ function createVideoEditor(mount, options = {}) {
     for (const c of clips) {
       const th = THEMES[c.theme];
       const kind = trackKind(c.track);
+      const sourceMedia = c.path ? mediaItems.find((item) => item.path === c.path) : null;
+      const thumbnailStrip = kind === "video" && (sourceMedia?.filmstrip || sourceMedia?.thumbnail)
+        ? h("span", { class: "ed-clip__thumbs", "aria-hidden": "true" },
+          h("img", { src: sourceMedia.filmstrip || sourceMedia.thumbnail, alt: "", draggable: "false" }))
+        : null;
+      const actualWaveform = sourceMedia?.waveform;
+      const hasAudio = c.hasAudio || sourceMedia?.hasAudio;
+      const clipWaveform = kind === "audio"
+        ? h("span", { class: "ed-clip__wave" }, actualWaveform ? h("img", { src: actualWaveform, alt: "", draggable: "false" }) : h("span", { html: waveform(parseInt(c.id.slice(1) || "1", 10)) }))
+        : kind === "video" && hasAudio
+          ? h("span", { class: "ed-clip__wave ed-clip__wave--embedded" }, actualWaveform
+            ? h("img", { src: actualWaveform, alt: "", draggable: "false" })
+            : h("span", { html: waveform(parseInt(c.id.slice(1) || "1", 10)) }))
+          : null;
       const el = h("div", { class: `ed-clip ed-clip--${kind}` + (c.id === selectedId ? " is-selected" : "") + (hasFx(c) ? " has-fx" : ""), "data-id": c.id },
+        thumbnailStrip,
         h("span", { class: "ed-clip__h ed-clip__h--l" }), h("span", { class: "ed-clip__h ed-clip__h--r" }),
-        kind === "audio" ? h("span", { class: "ed-clip__wave", html: waveform(parseInt(c.id.slice(1) || "1", 10)) }) : null,
+        clipWaveform,
         h("span", { class: "ed-clip__label" }, icon(kind === "audio" ? "music" : c.theme === "title" ? "type" : "film", 13), c.label),
         h("span", { class: "ed-clip__fx", title: "Effects applied" }, icon("sparkles", 12)));
       if (th) { const [c1, c2] = th.clip || [th.sky[1], th.sky[2]]; el.style.setProperty("--c1", c1); el.style.setProperty("--c2", c2); }
@@ -2439,22 +2519,46 @@ function createVideoEditor(mount, options = {}) {
   function onClipContextMenu(e, c) {
     e.preventDefault();
     document.querySelector(".ed-ctx")?.remove();
-    const isLinked = !!c.linkedAudioId || clips.some(x => x.linkedAudioId === c.id);
+    const linkedAudio = c.linkedAudioId ? clips.find((x) => x.id === c.linkedAudioId) : clips.find((x) => x.linkedAudioId === c.id);
+    const isLinked = !!linkedAudio;
+    const sourceMedia = c.path ? mediaItems.find((item) => item.path === c.path) : null;
+    const relinkCandidate = !isLinked && c.path
+      ? clips.find((x) => x.id !== c.id && !x.linkedAudioId && x.path === c.path
+        && trackKind(x.track) !== trackKind(c.track) && Math.abs(x.start - c.start) < 0.1)
+      : null;
+    const canSeparate = isVisual(c) && (c.hasAudio || sourceMedia?.hasAudio) && !isLinked && !relinkCandidate;
+    const actionLabel = canSeparate ? "Separate Audio" : isLinked ? "Unlink Audio & Video" : "Relink Audio & Video";
+    const linkAction = h("button", { type: "button", disabled: !canSeparate && !isLinked && !relinkCandidate }, actionLabel);
     const menu = h("div", { class: "ed-ctx" },
-      h("button", { type: "button" }, isLinked ? "Unlink Audio & Video" : "Relink Audio & Video"),
+      linkAction,
       h("button", { type: "button" }, "Delete Clip")
     );
     menu.style.left = e.pageX + "px"; menu.style.top = e.pageY + "px";
     menu.firstChild.addEventListener("click", () => {
       menu.remove();
       const before = snapshot();
-      if (isLinked) {
+      if (canSeparate) {
+        const audioTracks = ["a1", "a2"];
+        const lane = audioTracks.find((track) => !clips.some((x) => x.track === track && timeOverlap(c.start, c.start + c.dur, x.start, x.start + x.dur)))
+          || audioTracks.sort((a, b) => clips.filter((x) => x.track === a && timeOverlap(c.start, c.start + c.dur, x.start, x.start + x.dur)).length
+            - clips.filter((x) => x.track === b && timeOverlap(c.start, c.start + c.dur, x.start, x.start + x.dur)).length)[0];
+        const audio = {
+          id: uid(), track: lane, start: c.start, dur: c.dur,
+          sourceDuration: c.sourceDuration || c.dur, sourceOffset: c.sourceOffset || 0,
+          label: `${c.label} (Audio)`, theme: "audio", mediaKind: "audio", hasAudio: true,
+          path: c.path, previewUrl: c.previewUrl, linkedAudioId: c.id, props: defaultProps(),
+        };
+        c.hasAudio = true;
+        c.linkedAudioId = audio.id;
+        clips.push(audio);
+        selectedId = audio.id;
+        loadProps(audio);
+      } else if (isLinked) {
         c.linkedAudioId = null;
-        clips.forEach(x => { if (x.linkedAudioId === c.id) x.linkedAudioId = null; });
-      } else {
-        // find nearest audio/video
-        const match = clips.find(x => x.id !== c.id && Math.abs(x.start - c.start) < 0.1);
-        if (match) { c.linkedAudioId = match.id; match.linkedAudioId = c.id; }
+        clips.forEach((x) => { if (x.linkedAudioId === c.id || x.id === linkedAudio?.id) x.linkedAudioId = null; });
+      } else if (relinkCandidate) {
+        c.linkedAudioId = relinkCandidate.id;
+        relinkCandidate.linkedAudioId = c.id;
       }
       commit(before);
     });

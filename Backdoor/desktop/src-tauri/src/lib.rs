@@ -26,6 +26,9 @@ struct MediaAsset {
     duration: f64,
     kind: String,
     has_audio: bool,
+    thumbnail: Option<String>,
+    filmstrip: Option<String>,
+    waveform: Option<String>,
 }
 
 #[tauri::command]
@@ -45,20 +48,82 @@ fn inspect_media(path: PathBuf) -> Result<MediaAsset, String> {
         else if ["mp3", "wav", "m4a", "aac", "flac", "ogg"].contains(&extension.as_str()) { "audio" }
         else if ["mp4", "mov", "mkv", "avi", "webm", "m4v"].contains(&extension.as_str()) { "video" }
         else { return Err("This file type is not supported".into()); };
-    let mut duration = if kind == "image" { 5.0 } else { 8.0 };
+    let mut duration = 5.0;
     let mut has_audio = false;
     if kind != "image" {
         let probe = multimedia_binary("ffprobe");
-        if let Ok(output) = Command::new(probe).args(["-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1"]).arg(&path).output() {
-            if output.status.success() {
-                for line in String::from_utf8_lossy(&output.stdout).lines().map(str::trim) {
-                    has_audio |= line == "audio";
-                    if let Ok(seconds) = line.parse::<f64>() { if seconds.is_finite() { duration = seconds.max(0.25); } }
-                }
-            }
+        let output = Command::new(probe)
+            .args(["-v", "error", "-show_entries", "format=duration:stream=codec_type,duration", "-of", "json"])
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("Could not start FFprobe to read media duration: {error}"))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(if detail.is_empty() { "FFprobe could not read the selected media file".into() } else { detail });
         }
+        let metadata: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("FFprobe returned invalid media information: {error}"))?;
+        let as_seconds = |value: &Value| value.as_f64().or_else(|| value.as_str()?.parse::<f64>().ok()).filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+        has_audio = metadata["streams"].as_array().map(|streams| streams.iter().any(|stream| stream["codec_type"].as_str() == Some("audio"))).unwrap_or(false);
+        duration = as_seconds(&metadata["format"]["duration"])
+            .or_else(|| metadata["streams"].as_array()?.iter().filter_map(|stream| as_seconds(&stream["duration"])).reduce(f64::max))
+            .ok_or_else(|| "FFprobe did not report a usable media duration".to_owned())?;
     }
-    Ok(MediaAsset { name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Media").to_owned(), path: path.to_string_lossy().into_owned(), duration, kind: kind.into(), has_audio })
+    let thumbnail = if kind == "video" { ffmpeg_image_data(&path, duration) } else { None };
+    let filmstrip = if kind == "video" { ffmpeg_filmstrip_data(&path, duration) } else { None };
+    let waveform = if has_audio { ffmpeg_waveform_data(&path) } else { None };
+    Ok(MediaAsset {
+        name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Media").to_owned(),
+        path: path.to_string_lossy().into_owned(), duration, kind: kind.into(), has_audio, thumbnail, filmstrip, waveform,
+    })
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0] as usize;
+        let b = chunk.get(1).copied().unwrap_or(0) as usize;
+        let c = chunk.get(2).copied().unwrap_or(0) as usize;
+        encoded.push(TABLE[a >> 2] as char);
+        encoded.push(TABLE[((a & 3) << 4) | (b >> 4)] as char);
+        encoded.push(if chunk.len() > 1 { TABLE[((b & 15) << 2) | (c >> 6)] as char } else { '=' });
+        encoded.push(if chunk.len() > 2 { TABLE[c & 63] as char } else { '=' });
+    }
+    encoded
+}
+
+fn ffmpeg_image_data(path: &Path, duration: f64) -> Option<String> {
+    let seek = format!("{:.3}", (duration * 0.15).clamp(0.0, (duration - 0.1).max(0.0)));
+    let output = Command::new(multimedia_binary("ffmpeg"))
+        .args(["-v", "error", "-ss", seek.as_str(), "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-an", "-vf", "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2:color=black", "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "pipe:1"])
+        .output().ok()?;
+    if !output.status.success() || output.stdout.is_empty() { return None; }
+    Some(format!("data:image/jpeg;base64,{}", base64_encode(&output.stdout)))
+}
+
+fn ffmpeg_filmstrip_data(path: &Path, duration: f64) -> Option<String> {
+    let frame_rate = format!("6/{duration:.5}");
+    let filter = format!("fps={frame_rate},scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2:color=black,tile=layout=6x1:nb_frames=6:padding=0:margin=0");
+    let output = Command::new(multimedia_binary("ffmpeg"))
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-an", "-vf", filter.as_str(), "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "pipe:1"])
+        .output().ok()?;
+    if !output.status.success() || output.stdout.is_empty() { return None; }
+    Some(format!("data:image/png;base64,{}", base64_encode(&output.stdout)))
+}
+
+fn ffmpeg_waveform_data(path: &Path) -> Option<String> {
+    let output = Command::new(multimedia_binary("ffmpeg"))
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-filter_complex", "[0:a]aformat=channel_layouts=mono,showwavespic=s=1200x80:colors=white@0.9:scale=sqrt:draw=full,colorkey=black:0.02:0.0,format=rgba[wave]", "-map", "[wave]", "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "pipe:1"])
+        .output().ok()?;
+    if !output.status.success() || output.stdout.is_empty() { return None; }
+    Some(format!("data:image/png;base64,{}", base64_encode(&output.stdout)))
 }
 
 fn multimedia_binary(tool: &str) -> PathBuf {
