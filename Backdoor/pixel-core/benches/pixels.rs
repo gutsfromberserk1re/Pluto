@@ -53,7 +53,7 @@ fn main() {
     println!("operation,width,height,warmup,samples,iterations_per_sample,mean_ns,median_ns,p95_ns,pixels_per_sec");
     let (width, height) = (1280, 720);
     let stride = width * 4;
-    let source_bytes: Vec<u8> = (0..stride * height)
+    let source_bytes: Vec<u8> = (0usize..stride * height)
         .map(|index| index.wrapping_mul(31) as u8)
         .collect();
     let source = ImageView::new(&source_bytes, width, height, stride, PixelFormat::Rgba8).unwrap();
