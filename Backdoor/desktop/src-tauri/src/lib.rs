@@ -936,6 +936,15 @@ fn timeline_initialize(state: State<'_, SharedTimeline>, clips: Vec<Clip>) -> Re
 }
 
 #[tauri::command]
+fn timeline_sync(state: State<'_, SharedTimeline>, clips: Vec<Clip>) -> Result<f64, String> {
+    let mut timeline = state.lock().map_err(|_| "Timeline lock failed".to_owned())?;
+    let snapping = timeline.snapping;
+    *timeline = Timeline::new(clips).map_err(|error| format!("{error:?}"))?;
+    timeline.snapping = snapping;
+    Ok(timeline.duration_seconds)
+}
+
+#[tauri::command]
 fn timeline_add_clip(state: State<'_, SharedTimeline>, clip: Clip) -> Result<Timeline, String> {
     let mut timeline = state.lock().map_err(|_| "Timeline lock failed".to_owned())?;
     timeline.add_clip(clip).map_err(|error| format!("{error:?}"))?;
@@ -997,6 +1006,7 @@ pub fn run() {
             export_timeline,
             cancel_export,
             timeline_initialize,
+            timeline_sync,
             timeline_add_clip,
             timeline_move_clip,
             timeline_trim_clip,

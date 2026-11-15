@@ -6,6 +6,7 @@
   window.plutoTimeline = Object.freeze({
     get: () => call("timeline_get"),
     initialize: (clips) => call("timeline_initialize", { clips }),
+    sync: (clips) => call("timeline_sync", { clips }),
     addClip: (clip) => call("timeline_add_clip", { clip }),
     moveClip: ({ id, start, track, playhead, snapThreshold }) =>
       call("timeline_move_clip", { id, start, track, playhead, snapThreshold }),

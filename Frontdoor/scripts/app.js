@@ -1895,6 +1895,8 @@ function createVideoEditor(mount, options = {}) {
   const hist = { undo: [], redo: [] };
   let propertyChangeBefore = null, propertyChangeTimer = 0, propertyEditAnchor = null, propertyPointerActive = false;
   let nativeSyncQueue = Promise.resolve();
+  let nativeTimelineRevision = 0, nativeSyncedRevision = -1, nativeQueuedRevision = -1;
+  let nativeSyncPromise = Promise.resolve(null);
   let cachedDuration = null;
   let previewCandidateMode = "indexed";
   const dur = () => {
@@ -3258,14 +3260,32 @@ function createVideoEditor(mount, options = {}) {
     if (before === snapshot()) { if (flushed) changed(); return; }
     hist.undo.push(before); hist.redo.length = 0; changed();
   };
+  const NATIVE_SKIP_KEYS = ["thumbnail", "filmstrip", "waveform"];
+  const slimForNative = (clip) => {
+    const copy = { ...clip };
+    for (const key of NATIVE_SKIP_KEYS) delete copy[key];
+    return copy;
+  };
   const syncNativeTimeline = () => {
     if (!window.plutoTimeline) return Promise.resolve(null);
-    const payload = clone(clips);
-    const pending = nativeSyncQueue.then(() => window.plutoTimeline.initialize(payload));
-    nativeSyncQueue = pending.catch(() => {});
-    return pending.catch((error) => { root.dispatchEvent(new CustomEvent("pluto:backend-error", { detail: String(error) })); throw error; });
+    const revision = nativeTimelineRevision;
+    if (nativeSyncedRevision === revision || nativeQueuedRevision === revision) return nativeSyncPromise;
+    const payload = clone(clips.map(slimForNative));
+    const send = window.plutoTimeline.sync || window.plutoTimeline.initialize;
+    nativeQueuedRevision = revision;
+    const pending = nativeSyncQueue.then(() => {
+      if (revision !== nativeTimelineRevision) return null;
+      return Promise.resolve(send(payload)).then((result) => { nativeSyncedRevision = revision; return result; });
+    });
+    nativeSyncPromise = pending.catch((error) => {
+      if (nativeQueuedRevision === revision && nativeSyncedRevision !== revision) nativeQueuedRevision = -1;
+      root.dispatchEvent(new CustomEvent("pluto:backend-error", { detail: String(error) }));
+      throw error;
+    });
+    nativeSyncQueue = nativeSyncPromise.catch(() => {});
+    return nativeSyncPromise;
   };
-  const changed = () => { invalidateClipIndex(); syncNativeTimeline().catch(() => {}); panels.export.setSource({ duration: dur() }); renderAll(); updateInspector(); updateTime(); };
+  const changed = () => { nativeTimelineRevision++; invalidateClipIndex(); syncNativeTimeline().catch(() => {}); panels.export.setSource({ duration: dur() }); renderAll(); updateInspector(); updateTime(); };
   function updateHistBtns() { undoBtn.disabled = !hist.undo.length; redoBtn.disabled = !hist.redo.length; }
   function restore(str) {
     clips = JSON.parse(str);

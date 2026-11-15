@@ -1,0 +1,23 @@
+[package]
+name = "pluto-frontdoor-egui"
+version = "0.1.0"
+edition = "2021"
+description = "Native egui frontend for Pluto (replaces the webview UI)"
+license = "MIT"
+
+[[bin]]
+name = "pluto-frontdoor"
+path = "src/main.rs"
+
+[dependencies]
+# Windowing + immediate mode UI.
+eframe = { version = "0.37", default-features = true }
+
+# Logo (.ico) decoding for the title bar mark.
+image = { version = "0.25", default-features = false, features = ["ico"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

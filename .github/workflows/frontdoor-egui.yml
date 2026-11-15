@@ -1,0 +1,54 @@
+name: Frontdoor (egui)
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "Frontdoor-egui/**"
+      - "Backdoor/timeline-core/**"
+      - ".github/workflows/frontdoor-egui.yml"
+  pull_request:
+    paths:
+      - "Frontdoor-egui/**"
+      - "Backdoor/timeline-core/**"
+      - ".github/workflows/frontdoor-egui.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: Frontdoor-egui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Frontdoor-egui
+
+      # The UI code is written without a local toolchain, so the first passes of
+      # this workflow are the compile feedback loop. Diagnostics are surfaced but
+      # do not fail the run until the tree is warning-clean.
+      - name: cargo check
+        run: cargo check --all-targets 2>&1 | Tee-Object -FilePath check.log
+        continue-on-error: true
+
+      - name: Show diagnostics
+        if: always()
+        run: Get-Content check.log -Tail 200
+
+      - name: cargo build (release)
+        run: cargo build --release
+
+      - name: Upload portable binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pluto-frontdoor-windows
+          path: Frontdoor-egui/target/release/pluto-frontdoor.exe
+          if-no-files-found: warn
