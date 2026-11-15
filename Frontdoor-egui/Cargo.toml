@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Windowing + immediate mode UI.
-eframe = { version = "=0.37.0", default-features = true }
+eframe = { version = "=0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "links", "system_fonts"] }
 egui = "=0.37.0"
 pluto-timeline-core = { path = "../Backdoor/timeline-core" }
 pluto-media-engine = { path = "../Backdoor/media-engine" }
@@ -20,6 +20,9 @@ rfd = "0.15"
 
 # Logo (.ico) decoding for the title bar mark.
 image = { version = "0.25", default-features = false, features = ["ico", "png", "jpeg", "webp"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 opt-level = 3

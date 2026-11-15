@@ -43,6 +43,9 @@ Install FFmpeg and FFprobe on `PATH`, set `PLUTO_FFMPEG_DIR`, or keep them in an
 those tools, checks the egui and backend crates, and uploads a portable ZIP
 with the application and FFmpeg runtime.
 
+If the native window fails to appear, startup and panic details are written to
+`%LOCALAPPDATA%\Pluto\startup.log`.
+
 ## Visual reference
 
 `src/theme.rs` holds the palette, panel geometry, spacing, radii, and type

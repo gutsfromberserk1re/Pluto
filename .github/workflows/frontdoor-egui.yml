@@ -105,7 +105,6 @@ jobs:
         working-directory: Backdoor
       - name: Build native egui app
         id: app-build
-        continue-on-error: true
         shell: pwsh
         run: |
           cargo build --release 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/pluto-diagnostics/app-build.log"
@@ -114,7 +113,6 @@ jobs:
       - name: Validate bundled FFmpeg tools
         id: ffmpeg-check
         if: always()
-        continue-on-error: true
         shell: pwsh
         run: |
           $ffmpegDirectory = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/media-engine/ffmpeg'
