@@ -405,23 +405,21 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
     let color = &colors["color"];
     let detail = &colors["detail"];
     let brightness = (n(light, "exposure", 0.0) * 0.5 + n(light, "brightness", 0.0) / 100.0 * 0.25).clamp(-1.0, 1.0);
-    let contrast = (1.0 + n(light, "contrast", 0.0) / 100.0 + n(detail, "clarity", 0.0) / 180.0).clamp(0.0, 4.0);
+    let contrast = (1.0 + n(light, "contrast", 0.0) / 100.0).clamp(0.0, 4.0);
     let saturation = (1.0 + n(color, "saturation", 0.0) / 100.0 + n(color, "vibrance", 0.0) / 150.0).clamp(0.0, 3.0);
     let animated_color = keyframe_number_expr(clip, &["colors", "light", "exposure"], 0.0, start, "t").is_some()
         || keyframe_number_expr(clip, &["colors", "light", "brightness"], 0.0, start, "t").is_some()
         || keyframe_number_expr(clip, &["colors", "light", "contrast"], 0.0, start, "t").is_some()
-        || keyframe_number_expr(clip, &["colors", "detail", "clarity"], 0.0, start, "t").is_some()
         || keyframe_number_expr(clip, &["colors", "color", "saturation"], 0.0, start, "t").is_some()
         || keyframe_number_expr(clip, &["colors", "color", "vibrance"], 0.0, start, "t").is_some();
     if animated_color {
         let exposure = keyframe_number_expr(clip, &["colors", "light", "exposure"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "exposure", 0.0)));
         let light_brightness = keyframe_number_expr(clip, &["colors", "light", "brightness"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "brightness", 0.0)));
         let light_contrast = keyframe_number_expr(clip, &["colors", "light", "contrast"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "contrast", 0.0)));
-        let clarity = keyframe_number_expr(clip, &["colors", "detail", "clarity"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(detail, "clarity", 0.0)));
         let color_saturation = keyframe_number_expr(clip, &["colors", "color", "saturation"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(color, "saturation", 0.0)));
         let vibrance = keyframe_number_expr(clip, &["colors", "color", "vibrance"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(color, "vibrance", 0.0)));
         let brightness_expr = format!("min(max(({exposure})*0.5+({light_brightness})/100*0.25,-1),1)");
-        let contrast_expr = format!("min(max(1+({light_contrast})/100+({clarity})/180,0),4)");
+        let contrast_expr = format!("min(max(1+({light_contrast})/100,0),4)");
         let saturation_expr = format!("min(max(1+({color_saturation})/100+({vibrance})/150,0),3)");
         filters.push(format!("eq=brightness='{brightness_expr}':contrast='{contrast_expr}':saturation='{saturation_expr}':eval=frame"));
     } else if brightness.abs() > 0.0001 || (contrast - 1.0).abs() > 0.0001 || (saturation - 1.0).abs() > 0.0001 {
@@ -441,10 +439,19 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
             }
         }
     }
-    let sharpness = (n(detail, "sharpness", 0.0) / 100.0).clamp(0.0, 1.0);
-    if sharpness > 0.001 { filters.push(format!("unsharp=5:5:{sharpness:.4}:5:5:0")); }
-    let color_vignette = n(detail, "vignette", 0.0);
-    if color_vignette.abs() > 1.0 { filters.push(format!("vignette=angle={:.5}", (0.35 + color_vignette.abs() / 100.0 * 0.55).clamp(0.1, 1.2))); }
+    let clarity = (n(detail, "clarity", 0.0) / 100.0 * 0.9).clamp(-0.9, 0.9);
+    let sharpness = (n(detail, "sharpness", 0.0) / 100.0 * 0.9).clamp(0.0, 0.9);
+    let color_detail = (clarity + sharpness).clamp(-0.9, 1.5);
+    if color_detail.abs() > 0.001 { filters.push(format!("unsharp=5:5:{color_detail:.4}:5:5:0")); }
+    let color_vignette = (n(detail, "vignette", 0.0) / 100.0).clamp(-1.0, 1.0);
+    if color_vignette.abs() > 0.01 {
+        let edge = "max(0,min(1,(hypot(X-W/2,Y-H/2)/(min(W,H)*0.7)-0.68)/0.32))";
+        if color_vignette > 0.0 {
+            filters.push(format!("geq=r='min(255,r(X,Y)+255*{:.4}*{edge})':g='min(255,g(X,Y)+255*{:.4}*{edge})':b='min(255,b(X,Y)+255*{:.4}*{edge})':a='alpha(X,Y)'", color_vignette, color_vignette, color_vignette));
+        } else {
+            filters.push(format!("geq=r='r(X,Y)*(1-{:.4}*{edge})':g='g(X,Y)*(1-{:.4}*{edge})':b='b(X,Y)*(1-{:.4}*{edge})':a='alpha(X,Y)'", color_vignette.abs(), color_vignette.abs(), color_vignette.abs()));
+        }
+    }
 
     let preset = effects["preset"]["id"].as_str().unwrap_or("none");
     let intensity = (n(&effects["preset"], "intensity", 100.0) / 100.0).clamp(0.0, 1.0);
@@ -485,11 +492,18 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
     }
     if enabled(effects, "vignette") {
         let vignette = &effects["vignette"];
-        let angle = (0.12 + n(vignette, "midpoint", 50.0) / 100.0 * 1.08 + n(vignette, "amount", 0.0).abs() / 100.0 * 0.35).clamp(0.05, 1.5);
-        let aspect = (1.0 + n(vignette, "roundness", 0.0) / 100.0 * 0.8).clamp(0.2, 2.0);
-        let softness = (0.75 + n(vignette, "feather", 50.0) / 100.0 * 0.5).clamp(0.5, 1.5);
-        filters.push(format!("vignette=angle={angle:.4}:aspect={aspect:.3}:eval=frame"));
-        if (softness - 1.0).abs() > 0.01 { filters.push(format!("gblur=sigma={:.3}:steps=1", (softness - 1.0).abs() * 0.7)); }
+        let amount = (n(vignette, "amount", 0.0) / 100.0).clamp(-1.0, 1.0);
+        if amount.abs() > 0.01 {
+            let midpoint = (n(vignette, "midpoint", 50.0) / 100.0 * 0.8).clamp(0.0, 0.8);
+            let feather = (0.08 + n(vignette, "feather", 50.0) / 100.0 * 0.42).clamp(0.04, 0.5);
+            let roundness = (1.0 + n(vignette, "roundness", 0.0) / 100.0 * 0.8).clamp(0.2, 2.0);
+            let edge = format!("max(0,min(1,(hypot((X-W/2)*{roundness:.4},Y-H/2)/(min(W,H)*0.7)-{midpoint:.4})/{feather:.4}))");
+            if amount > 0.0 {
+                filters.push(format!("geq=r='min(255,r(X,Y)+255*{:.4}*{edge})':g='min(255,g(X,Y)+255*{:.4}*{edge})':b='min(255,b(X,Y)+255*{:.4}*{edge})':a='alpha(X,Y)'", amount, amount, amount));
+            } else {
+                filters.push(format!("geq=r='r(X,Y)*(1-{:.4}*{edge})':g='g(X,Y)*(1-{:.4}*{edge})':b='b(X,Y)*(1-{:.4}*{edge})':a='alpha(X,Y)'", amount.abs(), amount.abs(), amount.abs()));
+            }
+        }
     }
     if enabled(effects, "chromatic") {
         let a = n(&effects["chromatic"], "amount", 0.0) * 0.06;
