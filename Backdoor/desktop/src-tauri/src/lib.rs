@@ -22,6 +22,7 @@ fn ffmpeg_filter_path(path: &Path) -> String {
 #[serde(rename_all = "camelCase")]
 struct MediaAsset {
     path: String,
+    asset_version: String,
     name: String,
     duration: f64,
     kind: String,
@@ -51,8 +52,9 @@ impl Default for DerivedAssetCache {
 struct AssetJob { app: tauri::AppHandle, asset: MediaAsset, cache_key: String }
 
 const DERIVED_CACHE_LIMIT: usize = 32 * 1024 * 1024;
-const DERIVED_WORKER_COUNT: usize = 2;
 const DERIVED_QUEUE_CAPACITY: usize = 8;
+const WAVEFORM_FILTER: &str = include_str!("../../../media-filters/waveform.txt");
+const VIDEO_ASSET_FILTER: &str = include_str!("../../../media-filters/video-assets.txt");
 static DERIVED_ASSET_CACHE: OnceLock<Mutex<DerivedAssetCache>> = OnceLock::new();
 static PENDING_ASSET_JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static ASSET_JOB_SENDER: OnceLock<SyncSender<AssetJob>> = OnceLock::new();
@@ -105,7 +107,7 @@ fn inspect_media(path: PathBuf) -> Result<(MediaAsset, Option<String>), String> 
         || (has_audio && cached.waveform.is_none());
     let asset = MediaAsset {
         name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Media").to_owned(),
-        path: path.to_string_lossy().into_owned(), duration, kind: kind.into(), has_audio,
+        path: path.to_string_lossy().into_owned(), asset_version: cache_key.clone(), duration, kind: kind.into(), has_audio,
         thumbnail: cached.thumbnail, filmstrip: cached.filmstrip, waveform: cached.waveform,
     };
     Ok((asset, needs_derived_assets.then_some(cache_key)))
@@ -160,7 +162,7 @@ fn asset_job_sender() -> &'static SyncSender<AssetJob> {
     ASSET_JOB_SENDER.get_or_init(|| {
         let (sender, receiver) = sync_channel::<AssetJob>(DERIVED_QUEUE_CAPACITY);
         let receiver = Arc::new(Mutex::new(receiver));
-        for worker_id in 0..DERIVED_WORKER_COUNT {
+        for worker_id in 0..derived_worker_count() {
             let worker_receiver = Arc::clone(&receiver);
             let _ = thread::Builder::new().name(format!("pluto-media-assets-{worker_id}")).spawn(move || {
                 loop {
@@ -192,6 +194,14 @@ fn asset_job_sender() -> &'static SyncSender<AssetJob> {
         }
         sender
     })
+}
+
+fn derived_worker_count_for(parallelism: usize) -> usize {
+    if parallelism <= 2 { 1 } else { 2 }
+}
+
+fn derived_worker_count() -> usize {
+    thread::available_parallelism().map(|parallelism| derived_worker_count_for(parallelism.get())).unwrap_or(1)
 }
 
 async fn enqueue_asset_job(job: AssetJob) -> Result<(), String> {
@@ -240,12 +250,12 @@ fn ffmpeg_video_assets(path: &Path, duration: f64) -> (Option<String>, Option<St
     let thumbnail_path = temp.join("thumbnail.jpg");
     let filmstrip_path = temp.join("filmstrip.png");
     let seek = format!("{:.3}", (duration * 0.15).clamp(0.0, (duration - 0.1).max(0.0)));
-    let frame_rate = format!("6/{duration:.5}");
-    let filter = format!("[0:v]select='gte(t,{seek})',scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2:color=black[thumb];[0:v]fps={frame_rate},scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2:color=black,tile=layout=6x1:nb_frames=6:padding=0:margin=0[film]");
+    let frame_rate = format!("{:.5}", 6.0 / duration.max(0.001));
+    let filter = VIDEO_ASSET_FILTER.replace("{seek}", &seek).replace("{frame_rate}", &frame_rate);
     let output = Command::new(multimedia_binary("ffmpeg"))
-        .args(["-y", "-v", "error", "-i"])
+        .args(["-y", "-v", "error", "-threads", "1", "-i"])
         .arg(path)
-        .args(["-filter_complex", filter.as_str(), "-map", "[thumb]", "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "5"])
+        .args(["-filter_complex_threads", "1", "-filter_complex", filter.as_str(), "-map", "[thumb]", "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "5"])
         .arg(&thumbnail_path)
         .args(["-map", "[film]", "-frames:v", "1", "-c:v", "png"])
         .arg(&filmstrip_path)
@@ -261,9 +271,9 @@ fn ffmpeg_video_assets(path: &Path, duration: f64) -> (Option<String>, Option<St
 
 fn ffmpeg_waveform_data(path: &Path) -> Option<String> {
     let output = Command::new(multimedia_binary("ffmpeg"))
-        .args(["-v", "error", "-i"])
+        .args(["-v", "error", "-threads", "1", "-i"])
         .arg(path)
-        .args(["-filter_complex", "[0:a]aformat=channel_layouts=mono,showwavespic=s=1200x80:colors=white@0.9:scale=sqrt:draw=full,colorkey=black:0.02:0.0,format=rgba[wave]", "-map", "[wave]", "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "pipe:1"])
+        .args(["-filter_complex_threads", "1", "-filter_complex", WAVEFORM_FILTER.trim(), "-map", "[wave]", "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "pipe:1"])
         .output().ok()?;
     if !output.status.success() || output.stdout.is_empty() { return None; }
     Some(format!("data:image/png;base64,{}", base64_encode(&output.stdout)))
@@ -982,4 +992,29 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Pluto desktop application");
+}
+
+#[cfg(test)]
+mod media_performance_tests {
+    use super::*;
+
+    #[test]
+    fn derived_worker_pool_scales_down_for_low_core_hosts() {
+        assert_eq!(derived_worker_count_for(0), 1);
+        assert_eq!(derived_worker_count_for(1), 1);
+        assert_eq!(derived_worker_count_for(2), 1);
+        assert_eq!(derived_worker_count_for(3), 2);
+        assert_eq!(derived_worker_count_for(16), 2);
+    }
+
+    #[test]
+    fn imported_asset_exposes_a_revision_for_stale_result_filtering() {
+        let asset = MediaAsset {
+            path: "clip.mp4".into(), asset_version: "revision-1".into(), name: "clip.mp4".into(),
+            duration: 8.0, kind: "video".into(), has_audio: true,
+            thumbnail: None, filmstrip: None, waveform: None,
+        };
+        let value = serde_json::to_value(asset).unwrap();
+        assert_eq!(value["assetVersion"], "revision-1");
+    }
 }

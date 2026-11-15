@@ -1,0 +1,1 @@
+[0:v]select='gte(t,{seek})',scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2:color=black[thumb];[0:v]fps={frame_rate},scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2:color=black,tile=layout=6x1:nb_frames=6:padding=0:margin=0[film]

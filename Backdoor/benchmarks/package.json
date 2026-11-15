@@ -1,0 +1,11 @@
+{
+  "name": "pluto-performance-benchmarks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench:preview": "node preview.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}

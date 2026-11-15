@@ -486,6 +486,17 @@ mod tests {
     }
 
     #[test]
+    fn transition_lookup_returns_the_source_clip_transition() {
+        let mut source = clip("source", TrackId::V1, 0.0, 1.0);
+        source.extra.insert("trans".into(), serde_json::json!({ "type": "wipe", "dur": 0.4 }));
+        let timeline = Timeline::new(vec![source, clip("next", TrackId::V1, 1.0, 2.0)]).unwrap();
+        let (neighbor, transition) = timeline.transition_neighbor("source", true).unwrap().unwrap();
+        assert_eq!(neighbor.id.as_str(), "next");
+        assert_eq!(transition["type"].as_str(), Some("wipe"));
+        assert_eq!(timeline.transition_neighbor("next", false).unwrap().unwrap().1, transition);
+    }
+
+    #[test]
     fn serde_round_trip_rebuilds_the_private_index_without_changing_project_shape() {
         let timeline = Timeline::new(vec![clip("a", TrackId::V1, 0.0, 2.0)]).unwrap();
         let serialized = serde_json::to_value(&timeline).unwrap();

@@ -1,0 +1,9 @@
+[package]
+name = "pluto-pixel-core"
+version = "0.1.0"
+edition = "2021"
+description = "Safe reference pixel operations for Pluto"
+
+[[bench]]
+name = "pixels"
+harness = false

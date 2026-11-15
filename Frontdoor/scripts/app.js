@@ -1859,12 +1859,27 @@ function createVideoEditor(mount, options = {}) {
     text: { title: "", sub: "", size: 100, caption: "", align: "center" },
   });
   let clips = options.clips ? [...options.clips] : [];
+  if (!options.clips && options.benchmarkClipCount > 0) {
+    const count = clamp(Math.floor(Number(options.benchmarkClipCount) || 0), 1, 2_000);
+    clips = Array.from({ length: count }, (_, index) => ({
+      id: `bench-${index + 1}`, track: `v${(index % 4) + 1}`,
+      start: Math.floor(index / 4) * 1.5, dur: 6,
+      label: `Preview benchmark ${index + 1}`, theme: "coast", mediaKind: "image",
+      props: defaultProps(),
+    }));
+    nid = count + 1;
+  }
 
   let selectedId = null, time = 0, playing = false, loopOn = false, tool = "select", snapOn = true, pps = 24, projectName = "Untitled Project";
   const hist = { undo: [], redo: [] };
   let propertyChangeBefore = null, propertyChangeTimer = 0;
   let nativeSyncQueue = Promise.resolve();
-  const dur = () => Math.max(5, ...clips.map((c) => c.start + c.dur));
+  let cachedDuration = null;
+  let previewCandidateMode = "indexed";
+  const dur = () => {
+    if (cachedDuration == null) cachedDuration = clips.reduce((maximum, clip) => Math.max(maximum, clip.start + clip.dur), 5);
+    return cachedDuration;
+  };
   const sel = () => clips.find((c) => c.id === selectedId) || null;
   const isVisual = (c) => c && trackKind(c.track) === "video";
   let clipIndex = null;
@@ -1880,6 +1895,11 @@ function createVideoEditor(mount, options = {}) {
   };
   function rebuildClipIndex() {
     const indexed = clips.map((clip, order) => ({ clip, order }));
+    let duration = cachedDuration;
+    if (duration == null) {
+      duration = 5;
+      for (const { clip } of indexed) duration = Math.max(duration, clip.start + clip.dur);
+    }
     const startsByTrack = new Map(), endsByTrack = new Map();
     for (const item of indexed) {
       const track = item.clip.track;
@@ -1919,6 +1939,7 @@ function createVideoEditor(mount, options = {}) {
     for (let i = treeSize - 1; i > 0; i--) maxEnd[i] = Math.max(maxEnd[i * 2], maxEnd[i * 2 + 1]);
     const audioClips = clips.filter((clip) => trackKind(clip.track) === "audio" && (clip.previewUrl || clip.path));
     clipIndex = { nextById, previousById, previewEntries, maxEnd, treeSize, audioClips, audioIds: new Set(audioClips.map((clip) => clip.id)) };
+    cachedDuration = duration;
     return clipIndex;
   }
   const getClipIndex = () => clipIndex || rebuildClipIndex();
@@ -1934,12 +1955,52 @@ function createVideoEditor(mount, options = {}) {
     collectPreviewCandidates(index, node * 2 + 1, middle, right, limit, at, output);
   }
   const keyframeTolerance = 0.5 / FPS;
+  const invalidateClipIndex = () => { clipIndex = null; cachedDuration = null; };
   const clipKeyframes = (c) => Array.isArray(c?.keyframes) ? c.keyframes : [];
+  const compiledKeyframes = new WeakMap();
+  const keyframeRevisions = new WeakMap();
+  const invalidateKeyframeCache = (clip) => {
+    keyframeRevisions.set(clip, (keyframeRevisions.get(clip) || 0) + 1);
+    compiledKeyframes.delete(clip);
+  };
+  const compileKeyframes = (clip) => {
+    const keyframes = clipKeyframes(clip), revision = keyframeRevisions.get(clip) || 0;
+    let compiled = compiledKeyframes.get(clip);
+    if (!compiled || compiled.keyframes !== keyframes || compiled.revision !== revision || compiled.duration !== clip.dur || compiled.baseProps !== clip.props) {
+      const orderedKeyframes = keyframes
+        .map((keyframe, order) => ({ keyframe, time: Number(keyframe.time), order }))
+        .filter((entry) => Number.isFinite(entry.time))
+        .sort((left, right) => left.time - right.time || left.order - right.order);
+      const points = [{ time: 0, props: clip.props, easing: "linear" }, ...keyframes]
+        .map((point) => ({ ...point, time: clamp(Number(point.time) || 0, 0, clip.dur) }))
+        .sort((a, b) => a.time - b.time);
+      const unique = [];
+      for (const point of points) {
+        const last = unique[unique.length - 1];
+        if (last && Math.abs(last.time - point.time) < keyframeTolerance) unique[unique.length - 1] = point;
+        else unique.push(point);
+      }
+      compiled = { keyframes, revision, duration: clip.dur, baseProps: clip.props, orderedKeyframes, points: unique };
+      compiledKeyframes.set(clip, compiled);
+    }
+    return compiled;
+  };
   const currentKeyframe = (c, at = time) => {
     if (!c) return null;
     const local = at - c.start;
     if (local < -keyframeTolerance || local > c.dur + keyframeTolerance) return null;
-    return clipKeyframes(c).find((keyframe) => Math.abs(keyframe.time - clamp(local, 0, c.dur)) <= keyframeTolerance) || null;
+    const keys = compileKeyframes(c).orderedKeyframes, target = clamp(local, 0, c.dur);
+    let low = 0, high = keys.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (keys[middle].time < target - keyframeTolerance) low = middle + 1;
+      else high = middle;
+    }
+    let match = null;
+    for (let index = low; index < keys.length && keys[index].time <= target + keyframeTolerance; index++) {
+      if (Math.abs(keys[index].time - target) <= keyframeTolerance && (!match || keys[index].order < match.order)) match = keys[index];
+    }
+    return match?.keyframe || null;
   };
   const mixKeyframeValue = (from, to, amount) => {
     if (from === undefined) return amount >= 1 ? clone(to) : undefined;
@@ -1966,25 +2027,20 @@ function createVideoEditor(mount, options = {}) {
   const propsAt = (c, at = time) => {
     const keyframes = clipKeyframes(c);
     if (!keyframes.length) return c.props;
-    const points = [{ time: 0, props: c.props, easing: "linear" }, ...keyframes]
-      .map((point) => ({ ...point, time: clamp(Number(point.time) || 0, 0, c.dur) }))
-      .sort((a, b) => a.time - b.time);
-    const unique = [];
-    for (const point of points) {
-      const last = unique[unique.length - 1];
-      if (last && Math.abs(last.time - point.time) < keyframeTolerance) unique[unique.length - 1] = point;
-      else unique.push(point);
-    }
+    const compiled = compileKeyframes(c);
+    const unique = compiled.points;
     const local = clamp(at - c.start, 0, c.dur);
     if (local <= unique[0].time) return unique[0].props;
-    for (let index = 0; index < unique.length - 1; index++) {
-      const left = unique[index], right = unique[index + 1];
-      if (local <= right.time) {
-        const progress = (local - left.time) / Math.max(1e-6, right.time - left.time);
-        return mixKeyframeValue(left.props, right.props, easeKeyframe(progress, left.easing));
-      }
+    let low = 1, high = unique.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (unique[middle].time < local) low = middle + 1;
+      else high = middle;
     }
-    return unique[unique.length - 1].props;
+    if (low >= unique.length) return unique[unique.length - 1].props;
+    const left = unique[low - 1], right = unique[low];
+    const progress = (local - left.time) / Math.max(1e-6, right.time - left.time);
+    return mixKeyframeValue(left.props, right.props, easeKeyframe(progress, left.easing));
   };
   const captureKeyframe = (c, localTime, properties) => {
     c.keyframes ||= [];
@@ -1993,6 +2049,7 @@ function createVideoEditor(mount, options = {}) {
     if (keyframe) keyframe.props = clone(properties);
     else { keyframe = { time: at, easing: "linear", props: clone(properties) }; c.keyframes.push(keyframe); }
     c.keyframes.sort((a, b) => a.time - b.time);
+    invalidateKeyframeCache(c);
     return keyframe;
   };
   const keyframesForRange = (c, from, to, pinStart = false, pinEnd = false) => {
@@ -2095,6 +2152,7 @@ function createVideoEditor(mount, options = {}) {
   const mediaItems = [...MEDIA];
   const mediaByPath = new Map(mediaItems.filter((item) => item.path).map((item) => [item.path, item]));
   const pendingMediaAssets = new Map();
+  const mediaAssetKey = (asset) => JSON.stringify([asset?.path || "", asset?.assetVersion || ""]);
   const mediaEmpty = h("p", { class: "ed-media__empty" }, "No media imported yet");
   const search = h("input", { class: "ed-search", type: "text", placeholder: "Search media", spellcheck: "false", "aria-label": "Search media" });
   const renderMedia = () => {
@@ -2142,12 +2200,13 @@ function createVideoEditor(mount, options = {}) {
       if (!asset) return;
       const previewUrl = window.plutoNative.convertFileSrc(asset.path);
       const media = { ...asset, dur: asset.duration, label: asset.name, theme: asset.kind === "audio" ? "audio" : "coast", previewUrl, thumbnail: asset.thumbnail || (asset.kind === "image" ? previewUrl : null) };
-      const completed = pendingMediaAssets.get(asset.path);
+      const assetKey = mediaAssetKey(asset);
+      const completed = pendingMediaAssets.get(assetKey);
       if (completed) {
         media.thumbnail = completed.thumbnail || media.thumbnail;
         media.filmstrip = completed.filmstrip || media.filmstrip;
         media.waveform = completed.waveform || media.waveform;
-        pendingMediaAssets.delete(asset.path);
+        pendingMediaAssets.delete(assetKey);
       }
       mediaItems.push(media);
       if (media.path) mediaByPath.set(media.path, media);
@@ -2392,19 +2451,22 @@ function createVideoEditor(mount, options = {}) {
     return { layer, warp, content, ov, cap, mediaEl, sun: content.querySelector("[data-sun]"), clouds: content.querySelector("[data-clouds]") };
   }
 
-  function applyLayer(n, clip, lt) {
-    const { transform: T, colors: C, effects: E, text: P } = clip.props;
+  function applyLayer(n, clip, lt, animatedProps = clip.props) {
+    const { transform: T, colors: C, effects: E, text: P } = animatedProps;
+    const style = (element, property, value) => { if (element.style[property] !== value) element.style[property] = value; };
     const W = frame.clientWidth || 1, Hh = frame.clientHeight || 1, k = W / PW;
-    n.layer.style.transform = `translate(${T.position.x * k}px, ${T.position.y * k}px) rotate(${T.rotation}deg) scale(${T.scale.w / 100}, ${T.scale.h / 100})`;
+    style(n.layer, "transform", `translate(${T.position.x * k}px, ${T.position.y * k}px) rotate(${T.rotation}deg) scale(${T.scale.w / 100}, ${T.scale.h / 100})`);
     const D = T.distort || {}, tl = (D.tl || 0) * k, tr = (D.tr || 0) * k, br = (D.br || 0) * k, bl = (D.bl || 0) * k;
-    n.warp.style.transform = quadMatrix(W, Hh, [[tl, tl], [W - tr, tr], [W - br, Hh - br], [bl, Hh - bl]]);
+    style(n.warp, "transform", quadMatrix(W, Hh, [[tl, tl], [W - tr, tr], [W - br, Hh - br], [bl, Hh - bl]]));
     const cr = T.crop;
-    n.layer.style.clipPath = cr.top || cr.right || cr.bottom || cr.left ? `inset(${cr.top * k}px ${cr.right * k}px ${cr.bottom * k}px ${cr.left * k}px)` : "none";
+    style(n.layer, "clipPath", cr.top || cr.right || cr.bottom || cr.left ? `inset(${cr.top * k}px ${cr.right * k}px ${cr.bottom * k}px ${cr.left * k}px)` : "none");
     if (clip.theme === "title") {
       const big = n.content.querySelector(".ed-title__big"), sub = n.content.querySelector(".ed-title__sub");
-      big.textContent = P.title; sub.textContent = P.sub; sub.hidden = !P.sub;
-      big.style.fontSize = `${(7.2 * P.size) / 100}cqw`; sub.style.fontSize = `${(2.2 * P.size) / 100}cqw`;
-      n.content.style.textAlign = P.align || "center";
+      if (big.textContent !== P.title) big.textContent = P.title;
+      if (sub.textContent !== P.sub) sub.textContent = P.sub;
+      if (sub.hidden === !!P.sub) sub.hidden = !P.sub;
+      style(big, "fontSize", `${(7.2 * P.size) / 100}cqw`); style(sub, "fontSize", `${(2.2 * P.size) / 100}cqw`);
+      style(n.content, "textAlign", P.align || "center");
     }
     const filters = [];
     const preset = PRESETS.find(item => item.id === E.preset?.id);
@@ -2432,39 +2494,40 @@ function createVideoEditor(mount, options = {}) {
     if (E.glitch?.enabled) filters.push(`hue-rotate(${Math.sin(lt * (E.glitch.speed || 50)) * (E.glitch.amount || 0) * .25}deg)`);
     if (E.lens?.enabled || E.fisheye?.enabled) filters.push(`saturate(${1 + ((E.lens?.amount || E.fisheye?.amount || 0) / 220)})`);
     if (E.posterize?.enabled) filters.push(`contrast(${1 + (E.posterize.levels || 6) / 18})`);
-    n.content.style.filter = filters.join(" ");
-    n.content.style.imageRendering = E.pixelate?.enabled ? "pixelated" : "";
+    style(n.content, "filter", filters.join(" "));
+    style(n.content, "imageRendering", E.pixelate?.enabled ? "pixelated" : "");
     const vignette = E.vignette?.enabled ? Math.max(0, -(E.vignette.amount || 0)) / 100 : Math.max(0, -(detail.vignette || 0)) / 100;
-    n.ov.vig.style.background = `radial-gradient(ellipse at center, transparent ${Math.max(10, 78 - vignette * 45)}%, rgba(0,0,0,${vignette * .9}) 100%)`;
-    n.ov.vig.style.opacity = String(vignette);
+    style(n.ov.vig, "background", `radial-gradient(ellipse at center, transparent ${Math.max(10, 78 - vignette * 45)}%, rgba(0,0,0,${vignette * .9}) 100%)`);
+    style(n.ov.vig, "opacity", String(vignette));
     const grain = E.grain?.enabled ? (E.grain.amount || 0) / 100 : 0;
-    n.ov.grain.style.backgroundImage = NOISE;
-    n.ov.grain.style.opacity = String(grain * .42);
+    style(n.ov.grain, "backgroundImage", NOISE);
+    style(n.ov.grain, "opacity", String(grain * .42));
     const scan = E.scanlines?.enabled ? (E.scanlines.amount || 0) / 100 : 0;
-    n.ov.scan.style.background = `repeating-linear-gradient(to bottom, rgba(0,0,0,${scan}) 0 1px, transparent 1px ${Math.max(2, E.scanlines.spacing || 3)}px)`;
-    n.ov.scan.style.opacity = String(scan);
+    style(n.ov.scan, "background", `repeating-linear-gradient(to bottom, rgba(0,0,0,${scan}) 0 1px, transparent 1px ${Math.max(2, E.scanlines.spacing || 3)}px)`);
+    style(n.ov.scan, "opacity", String(scan));
     const halftone = E.halftone?.enabled ? (E.halftone.contrast || 0) / 100 : 0;
     const dotSize = Math.max(2, E.halftone?.size || 5);
-    n.ov.gs.style.backgroundImage = `radial-gradient(rgba(0,0,0,.78) .65px, transparent .8px)`;
-    n.ov.gs.style.backgroundSize = `${dotSize}px ${dotSize}px`;
-    n.ov.gs.style.opacity = String(halftone * .65);
-    n.ov.temp.style.background = (color.temperature || 0) >= 0 ? "rgba(255,150,55,.22)" : "rgba(65,145,255,.22)";
-    n.ov.temp.style.opacity = String(Math.abs(color.temperature || 0) / 450);
+    style(n.ov.gs, "backgroundImage", "radial-gradient(rgba(0,0,0,.78) .65px, transparent .8px)");
+    style(n.ov.gs, "backgroundSize", `${dotSize}px ${dotSize}px`);
+    style(n.ov.gs, "opacity", String(halftone * .65));
+    style(n.ov.temp, "background", (color.temperature || 0) >= 0 ? "rgba(255,150,55,.22)" : "rgba(65,145,255,.22)");
+    style(n.ov.temp, "opacity", String(Math.abs(color.temperature || 0) / 450));
     const leak = E.lightLeak?.enabled ? E.lightLeak : E.filmBurn?.enabled ? E.filmBurn : null;
     const leakPosition = leak ? (leak.position ?? leak.edge ?? 35) : 35;
     const leakWarmth = leak ? (leak.warmth ?? 65) : 65;
-    n.ov.gh.style.background = `radial-gradient(ellipse at ${leakPosition}% 22%, hsla(${28 + leakWarmth * .18} 95% 65% / .72), transparent ${42 + (leak?.edge || 0) * .18}%)`;
-    n.ov.gh.style.opacity = E.filmBurn?.enabled ? (E.filmBurn.amount || 0) / 100 : E.lightLeak?.enabled ? (E.lightLeak.amount || 0) / 100 : 0;
-    n.ov.glow.style.background = "radial-gradient(circle, rgba(255,255,235,.5), transparent 65%)";
-    n.ov.glow.style.opacity = E.glow?.enabled ? (E.glow.amount || 0) / 200 : 0;
+    style(n.ov.gh, "background", `radial-gradient(ellipse at ${leakPosition}% 22%, hsla(${28 + leakWarmth * .18} 95% 65% / .72), transparent ${42 + (leak?.edge || 0) * .18}%)`);
+    style(n.ov.gh, "opacity", String(E.filmBurn?.enabled ? (E.filmBurn.amount || 0) / 100 : E.lightLeak?.enabled ? (E.lightLeak.amount || 0) / 100 : 0));
+    style(n.ov.glow, "background", "radial-gradient(circle, rgba(255,255,235,.5), transparent 65%)");
+    style(n.ov.glow, "opacity", String(E.glow?.enabled ? (E.glow.amount || 0) / 200 : 0));
     const shakeAmount = E.shake?.enabled ? (E.shake.amount || 0) * .04 : 0;
     const shakeFrequency = E.shake?.frequency || 8;
     const shakeX = Math.sin(lt * shakeFrequency * Math.PI * 2) * shakeAmount;
     const shakeY = Math.cos(lt * shakeFrequency * Math.PI * 2) * shakeAmount;
     const mirrorTransform = E.mirror?.enabled ? (E.mirror.axis === "vertical" ? "scaleY(-1) " : "scaleX(-1) ") : "";
-    if (n.mediaEl) n.mediaEl.style.transform = `${mirrorTransform}translate(${shakeX}px, ${shakeY}px)`;
-    n.content.style.transform = n.mediaEl ? "" : `translate(${shakeX}px, ${shakeY}px)`;
-    n.cap.hidden = !P.caption; n.cap.textContent = P.caption;
+    if (n.mediaEl) style(n.mediaEl, "transform", `${mirrorTransform}translate(${shakeX}px, ${shakeY}px)`);
+    style(n.content, "transform", n.mediaEl ? "" : `translate(${shakeX}px, ${shakeY}px)`);
+    if (n.cap.hidden === !!P.caption) n.cap.hidden = !P.caption;
+    if (n.cap.textContent !== P.caption) n.cap.textContent = P.caption;
     if (n.mediaEl?.tagName === "VIDEO") {
       const target = Math.max(0, lt + Number(clip.sourceOffset || 0));
       if (Math.abs(n.mediaEl.currentTime - target) > 0.35) n.mediaEl.currentTime = target;
@@ -2497,7 +2560,9 @@ function createVideoEditor(mount, options = {}) {
 
   function renderPreview() {
     const index = getClipIndex(), candidates = [];
-    if (index.previewEntries.length) {
+    if (previewCandidateMode === "linear") {
+      for (const entry of index.previewEntries) if (entry.start <= time && entry.end > time) candidates.push(entry.clip);
+    } else if (index.previewEntries.length) {
       const limit = lowerBoundBy(index.previewEntries, time + Number.EPSILON, (entry) => entry.start);
       collectPreviewCandidates(index, 1, 0, index.treeSize, limit, time, candidates);
     }
@@ -2508,11 +2573,14 @@ function createVideoEditor(mount, options = {}) {
     active.forEach(({ c, f }, i) => {
       let n = layerNodes.get(c.id);
       if (!n) { n = makeLayer(c); layerNodes.set(c.id, n); frame.insertBefore(n.layer, gridEl); }
-      n.layer.style.zIndex = i + 1;
-      const animatedClip = { ...c, props: propsAt(c, time) };
-      applyLayer(n, animatedClip, Math.max(0, time - c.start));
-      const opacity = clamp(Number(animatedClip.props.transform?.opacity ?? 100) / 100, 0, 1);
-      n.warp.style.opacity = String(f.op * opacity); n.warp.style.clipPath = f.clip;
+      const zIndex = String(i + 1);
+      if (n.layer.style.zIndex !== zIndex) n.layer.style.zIndex = zIndex;
+      const animatedProps = propsAt(c, time);
+      applyLayer(n, c, Math.max(0, time - c.start), animatedProps);
+      const opacity = clamp(Number(animatedProps.transform?.opacity ?? 100) / 100, 0, 1);
+      const warpOpacity = String(f.op * opacity);
+      if (n.warp.style.opacity !== warpOpacity) n.warp.style.opacity = warpOpacity;
+      if (n.warp.style.clipPath !== f.clip) n.warp.style.clipPath = f.clip;
     });
     syncAudioPreview();
     const s = sel();
@@ -2520,7 +2588,8 @@ function createVideoEditor(mount, options = {}) {
     selBox.hidden = !show;
     if (show) {
       const transform = propsAt(s, time).transform;
-      selBox.style.transform = `translate(${transform.position.x * ((frame.clientWidth || 1) / PW)}px, ${transform.position.y * ((frame.clientHeight || 1) / PH)}px) rotate(${transform.rotation}deg) scale(${transform.scale.w / 100}, ${transform.scale.h / 100})`;
+      const selectionTransform = `translate(${transform.position.x * ((frame.clientWidth || 1) / PW)}px, ${transform.position.y * ((frame.clientHeight || 1) / PH)}px) rotate(${transform.rotation}deg) scale(${transform.scale.w / 100}, ${transform.scale.h / 100})`;
+      if (selBox.style.transform !== selectionTransform) selBox.style.transform = selectionTransform;
     }
   }
 
@@ -2761,7 +2830,7 @@ function createVideoEditor(mount, options = {}) {
     const c = sel();
     if (!c || time < c.start - keyframeTolerance || time > c.start + c.dur + keyframeTolerance) return;
     const before = snapshot(), local = clamp(time - c.start, 0, c.dur), at = currentKeyframe(c);
-    if (at) c.keyframes = clipKeyframes(c).filter((item) => item !== at);
+    if (at) { c.keyframes = clipKeyframes(c).filter((item) => item !== at); invalidateKeyframeCache(c); }
     else captureKeyframe(c, local, propsAt(c, time));
     loadProps(c); commit(before);
   }
@@ -2796,7 +2865,7 @@ function createVideoEditor(mount, options = {}) {
         choice.addEventListener("click", () => {
           menu.remove();
           if ((keyframe.easing || "linear") === value) return;
-          const before = snapshot(); keyframe.easing = value; commit(before);
+          const before = snapshot(); keyframe.easing = value; invalidateKeyframeCache(c); commit(before);
           if (sel()?.id === c.id) loadProps(c);
         });
         return choice;
@@ -2830,6 +2899,7 @@ function createVideoEditor(mount, options = {}) {
       }
       latest = next; keyframe.time = next;
       c.keyframes.sort((a, b) => a.time - b.time);
+      invalidateKeyframeCache(c);
       const marker = clipEls.get(c.id)?.querySelector(`.ed-keyframe[data-key-time="${original}"]`);
       if (marker) { marker.style.left = `${next * pps}px`; marker.dataset.keyTime = String(original); }
       showSnap(snapped ? c.start + next : null);
@@ -2957,7 +3027,7 @@ function createVideoEditor(mount, options = {}) {
     nativeSyncQueue = pending.catch(() => {});
     return pending.catch((error) => { root.dispatchEvent(new CustomEvent("pluto:backend-error", { detail: String(error) })); throw error; });
   };
-  const changed = () => { clipIndex = null; syncNativeTimeline().catch(() => {}); panels.export.setSource({ duration: dur() }); renderAll(); updateInspector(); updateTime(); };
+  const changed = () => { invalidateClipIndex(); syncNativeTimeline().catch(() => {}); panels.export.setSource({ duration: dur() }); renderAll(); updateInspector(); updateTime(); };
   function updateHistBtns() { undoBtn.disabled = !hist.undo.length; redoBtn.disabled = !hist.redo.length; }
   function restore(str) { clips = JSON.parse(str); if (!sel()) selectedId = null; else loadProps(sel()); changed(); }
   const undo = () => { if (hist.undo.length) { hist.redo.push(snapshot()); restore(hist.undo.pop()); } };
@@ -3194,6 +3264,7 @@ function createVideoEditor(mount, options = {}) {
           : c.sourceOffset || 0;
         place(partner); refreshKeyframeMarkers(partner);
       }
+      invalidateClipIndex();
       place(c); refreshKeyframeMarkers(c); showSnap(snapT);
     }, () => { if (moved) commit(before); });
   }
@@ -3568,15 +3639,17 @@ function createVideoEditor(mount, options = {}) {
 
   let exportBusy = false, exportCancelled = false;
   const stopMediaAssets = window.plutoNative?.listenMediaAssets?.((asset) => {
-    const matches = asset?.path ? mediaItems.filter((media) => media.path === asset.path) : [];
+    const pathMatches = asset?.path ? mediaItems.filter((media) => media.path === asset.path) : [];
+    const matches = pathMatches.filter((media) => !media.assetVersion || !asset.assetVersion || media.assetVersion === asset.assetVersion);
     if (!matches.length) {
-      if (asset?.path) {
-        pendingMediaAssets.set(asset.path, asset);
+      // Ignore stale completions for a path already imported at a different file revision.
+      if (asset?.path && pathMatches.length === 0) {
+        pendingMediaAssets.set(mediaAssetKey(asset), asset);
         if (pendingMediaAssets.size > 32) pendingMediaAssets.delete(pendingMediaAssets.keys().next().value);
       }
       return;
     }
-    pendingMediaAssets.delete(asset.path);
+    pendingMediaAssets.delete(mediaAssetKey(asset));
     for (const media of matches) {
       media.thumbnail = asset.thumbnail || media.thumbnail;
       media.filmstrip = asset.filmstrip || media.filmstrip;
@@ -3639,15 +3712,56 @@ function createVideoEditor(mount, options = {}) {
   time = 0; updateTime();
   showTab("transform");
 
-  return {
+  const api = {
     el: root, panels,
     getProject: () => ({ name: projectName, duration: dur(), clips: clone(clips) }),
     select: (id) => select(id), play, pause, setTime,
     destroy() { pause(); clearTimeout(propertyChangeTimer); clearTimeout(backendNoticeTimer); flushPropertyChange(false); stopExportProgress?.then?.((unlisten) => unlisten()); stopMediaAssets?.then?.((unlisten) => unlisten()); for (const state of audioPreviewNodes.values()) { state.element.pause(); state.element.removeAttribute("src"); state.element.load(); } audioPreviewNodes.clear(); previewAudioContext?.close?.(); window.removeEventListener("keydown", onKey); Object.values(panels).forEach((p) => p.destroy()); root.remove(); },
   };
+  if (options.performanceBenchmark) {
+    api.measurePreview = ({ mode = "indexed", warmup = 30, iterations = 240 } = {}) => {
+      const sampleCount = clamp(Math.floor(Number(iterations) || 0), 1, 10_000);
+      const warmupCount = clamp(Math.floor(Number(warmup) || 0), 0, 2_000);
+      const originalTime = time, originalMode = previewCandidateMode, duration = Math.max(0.001, dur() - 0.001);
+      const sections = Math.min(4, Math.max(1, Math.floor(duration / (sampleCount / 30))));
+      const sectionLength = sampleCount / sections;
+      previewCandidateMode = mode === "linear" ? "linear" : "indexed";
+      const renderSample = (index) => {
+        const sample = index % sampleCount;
+        const section = Math.min(sections - 1, Math.floor(sample / sectionLength));
+        time = (section * duration / sections + (sample - section * sectionLength) / 30) % duration;
+        renderPreview();
+      };
+      for (let index = 0; index < warmupCount; index++) renderSample(index);
+      const samples = new Array(sampleCount);
+      for (let index = 0; index < sampleCount; index++) {
+        const started = performance.now();
+        renderSample(index + warmupCount);
+        samples[index] = (performance.now() - started) * 1e6;
+      }
+      time = originalTime;
+      previewCandidateMode = originalMode;
+      renderPreview();
+      samples.sort((left, right) => left - right);
+      const percentile = (fraction) => samples[Math.min(samples.length - 1, Math.floor((samples.length - 1) * fraction))];
+      return {
+        mode: mode === "linear" ? "linear_reference" : "indexed", clipCount: clips.length, warmup: warmupCount, iterations: sampleCount,
+        meanNs: samples.reduce((total, sample) => total + sample, 0) / samples.length,
+        medianNs: percentile(0.5), p95Ns: percentile(0.95),
+      };
+    };
+  }
+  return api;
 }
 
-window.editor = createVideoEditor(document.getElementById("app"));
+const previewBenchParams = new URLSearchParams(window.location.search);
+const previewBenchCount = previewBenchParams.get("perfbench") === "1"
+  ? clamp(Math.floor(Number(previewBenchParams.get("clips")) || 500), 1, 2_000)
+  : 0;
+window.editor = createVideoEditor(document.getElementById("app"), {
+  benchmarkClipCount: previewBenchCount,
+  performanceBenchmark: previewBenchCount > 0,
+});
 })();
 
 

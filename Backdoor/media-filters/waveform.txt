@@ -1,0 +1,1 @@
+[0:a]aformat=channel_layouts=mono,showwavespic=s=1200x80:colors=white@0.9:scale=sqrt:draw=full,colorkey=black:0.02:0.0,format=rgba[wave]

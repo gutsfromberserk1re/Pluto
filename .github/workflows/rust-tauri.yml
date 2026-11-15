@@ -17,8 +17,8 @@ permissions:
   contents: read
 
 jobs:
-  timeline-core:
-    name: Timeline core checks
+  performance-benchmarks:
+    name: Rust, browser, and media performance checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,19 +26,54 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: Backdoor -> target
-      - run: cargo check -p pluto-timeline-core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-ubuntu-1.63.0
+      - name: Install benchmark dependencies
+        run: npm --prefix Backdoor/benchmarks install --no-package-lock --no-audit --no-fund
+      - name: Install headless Chromium
+        run: Backdoor/benchmarks/node_modules/.bin/playwright install --with-deps chromium
+      - name: Ensure FFmpeg is available
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+      - run: cargo check -p pluto-timeline-core -p pluto-pixel-core
         working-directory: Backdoor
       - run: cargo test -p pluto-timeline-core
         working-directory: Backdoor
-      - name: Record timeline performance baseline
+      - run: cargo test -p pluto-pixel-core
+        working-directory: Backdoor
+      - name: Record timeline reference comparison
         shell: bash
         run: cargo bench -p pluto-timeline-core --bench timeline > target/timeline-bench.csv
         working-directory: Backdoor
+      - name: Record pixel reference comparison
+        shell: bash
+        run: cargo bench -p pluto-pixel-core --bench pixels > target/pixel-bench.csv
+        working-directory: Backdoor
+      - name: Check Frontdoor JavaScript syntax
+        run: |
+          node --check Frontdoor/scripts/app.js
+          node --check Frontdoor/scripts/tauri-timeline.js
+      - name: Record browser preview performance
+        run: node Backdoor/benchmarks/preview.mjs > Backdoor/target/preview-bench.csv
+      - name: Record FFmpeg media import performance
+        run: python3 Backdoor/benchmarks/media.py > Backdoor/target/media-bench.csv
       - uses: actions/upload-artifact@v4
         with:
-          name: Pluto-Timeline-Benchmark
+          name: Pluto-Performance-Benchmarks
           if-no-files-found: error
-          path: Backdoor/target/timeline-bench.csv
+          path: |
+            Backdoor/target/timeline-bench.csv
+            Backdoor/target/pixel-bench.csv
+            Backdoor/target/preview-bench.csv
+            Backdoor/target/media-bench.csv
 
   tauri-windows:
     name: Portable Windows preview build
