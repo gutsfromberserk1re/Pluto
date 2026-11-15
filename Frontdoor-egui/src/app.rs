@@ -224,6 +224,9 @@ pub struct PlutoApp {
     text_box_drag: Option<Pos2>,
     title_drag_origin: Option<(String, Pos2, f64, f64)>,
     logo: Option<egui::TextureHandle>,
+    startup_paint_requested: bool,
+    startup_frame_started: bool,
+    startup_frame_finished: bool,
 }
 
 impl PlutoApp {
@@ -313,6 +316,9 @@ impl PlutoApp {
             text_box_drag: None,
             title_drag_origin: None,
             logo,
+            startup_paint_requested: false,
+            startup_frame_started: false,
+            startup_frame_finished: false,
         }
     }
 
@@ -1356,17 +1362,47 @@ impl PlutoApp {
 }
 
 impl eframe::App for PlutoApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe initially hides the native window to avoid a blank flash.
+        // Ask it to render once while hidden so it can paint the editor and
+        // reveal the window on the first frame.
+        if !self.startup_paint_requested {
+            self.startup_paint_requested = true;
+            crate::log_startup_event("Requesting the first egui paint while the native window is hidden");
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+            ctx.request_repaint();
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         // egui 0.37 gives the application its root Ui directly. The root Ui
         // replaces the old Context -> CentralPanel::show entry point.
+        let first_frame = !self.startup_frame_started;
+        if first_frame {
+            self.startup_frame_started = true;
+            crate::log_startup_event("First editor UI frame started");
+        }
         let ctx = ui.ctx().clone();
         self.tick(&ctx);
+        if first_frame {
+            crate::log_startup_event("Initial editor state update completed");
+        }
         self.refresh_preview(&ctx);
+        if first_frame {
+            crate::log_startup_event("Initial preview update completed");
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::BG))
             .show(ui, |ui| self.shell(ui));
+        if first_frame {
+            crate::log_startup_event("Initial editor panels painted");
+        }
         if self.show_export_settings && !self.export_busy {
             self.export_settings_window(&ctx);
+        }
+        if first_frame && !self.startup_frame_finished {
+            self.startup_frame_finished = true;
+            crate::log_startup_event("First editor UI frame completed");
         }
     }
 }

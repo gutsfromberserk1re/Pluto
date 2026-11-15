@@ -56,7 +56,12 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "Pluto",
         options,
-        Box::new(|cc| Ok(Box::new(app::PlutoApp::new(cc)))),
+        Box::new(|cc| {
+            log_startup_event("eframe app factory started");
+            let app = app::PlutoApp::new(cc);
+            log_startup_event("Pluto editor state initialized");
+            Ok(Box::new(app))
+        }),
     );
     if let Err(error) = &result {
         log_startup_event(&format!("Native window startup failed: {error}"));
@@ -75,7 +80,7 @@ fn startup_log_path() -> std::path::PathBuf {
         .join("startup.log")
 }
 
-fn log_startup_event(message: &str) {
+pub(crate) fn log_startup_event(message: &str) {
     use std::io::Write;
 
     let path = startup_log_path();
