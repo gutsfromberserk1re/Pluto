@@ -20,6 +20,7 @@
     exportTimeline: ({ settings, time }) => call("export_timeline", { settings, time }),
     cancelExport: () => call("cancel_export"),
     listenExportProgress: (callback) => window.__TAURI__?.event?.listen?.("export-progress", ({ payload }) => callback(payload)),
+    listenMediaAssets: (callback) => window.__TAURI__?.event?.listen?.("media-assets-ready", ({ payload }) => callback(payload)),
     convertFileSrc: (path) => window.__TAURI__?.core?.convertFileSrc?.(path) || path,
   });
 })();
