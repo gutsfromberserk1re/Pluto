@@ -3,6 +3,15 @@ use std::{collections::{HashMap, HashSet}, sync::OnceLock};
 
 const MIN_TIMELINE_SECONDS: f64 = 60.0;
 const EPSILON: f64 = 1e-7;
+const ADJACENCY_TOLERANCE: f64 = 0.05;
+
+fn within_adjacency_tolerance(value: f64, boundary: f64) -> bool {
+    let distance = (value - boundary).abs();
+    // Treat decimal boundaries such as 2.05 - 2.0 as exactly 50 ms even when
+    // binary floating-point rounding makes the computed distance slightly smaller.
+    let rounding_margin = f64::EPSILON * value.abs().max(boundary.abs()).max(1.0);
+    distance < ADJACENCY_TOLERANCE - rounding_margin
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum TrackId {
@@ -246,16 +255,16 @@ impl Timeline {
         let Some(track_index) = index.by_track.get(&clip.track) else { return Ok(None); };
         let boundary = if next { clip.end() } else { clip.start };
         let (entries, first) = if next {
-            (&track_index.by_start, track_index.lower_bound_start(&self.clips, boundary - 0.05))
+            (&track_index.by_start, track_index.lower_bound_start(&self.clips, boundary - ADJACENCY_TOLERANCE))
         } else {
-            (&track_index.by_end, track_index.lower_bound_end(&self.clips, boundary - 0.05))
+            (&track_index.by_end, track_index.lower_bound_end(&self.clips, boundary - ADJACENCY_TOLERANCE))
         };
         let candidate = entries[first..].iter().copied().take_while(|candidate| {
             let value = if next { self.clips[*candidate].start } else { self.clips[*candidate].end() };
-            value < boundary + 0.05
+            value < boundary + ADJACENCY_TOLERANCE
         }).filter(|candidate| {
             let other = &self.clips[*candidate];
-            other.id != id && ((if next { other.start } else { other.end() }) - boundary).abs() < 0.05
+            other.id != id && within_adjacency_tolerance(if next { other.start } else { other.end() }, boundary)
         }).min();
         Ok(candidate.map(|candidate| &self.clips[candidate]))
     }
@@ -483,6 +492,9 @@ mod tests {
         assert_eq!(timeline.adjacent_clip("source", true).unwrap().unwrap().id.as_str(), "first-in-vector");
         assert_eq!(timeline.adjacent_clip("edge-source", true).unwrap(), None);
         assert_eq!(timeline.adjacent_clip("outside-tolerance", false).unwrap(), None);
+        assert!(within_adjacency_tolerance(2.049, 2.0));
+        assert!(!within_adjacency_tolerance(2.05, 2.0));
+        assert!(!within_adjacency_tolerance(2.0, 2.05));
     }
 
     #[test]

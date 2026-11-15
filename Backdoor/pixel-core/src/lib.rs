@@ -451,7 +451,7 @@ mod tests {
         let height = 129;
         let stride = width * 4 + 7;
         let length = stride * (height - 1) + width * 4;
-        let input: Vec<u8> = (0..length).map(|index| index.wrapping_mul(29) as u8).collect();
+        let input: Vec<u8> = (0usize..length).map(|index| index.wrapping_mul(29) as u8).collect();
         let source = view(&input, width, height, stride, PixelFormat::Bgra8);
         let mut accelerated = vec![0xA5; length];
         let mut scalar = vec![0xA5; length];
