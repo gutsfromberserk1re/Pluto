@@ -1249,20 +1249,27 @@ impl PlutoApp {
     }
 
     fn add_media_clip(&mut self, media_id: u64, start: f64, track: TrackId) {
-        let Some(item) = self.media.iter().find(|item| item.id == media_id) else { return };
-        if (item.kind == Kind::Video) != track.is_video() {
+        // Copy out the media metadata first so the immutable borrow of
+        // `self.media` ends before `push_undo()` takes `&mut self`.
+        let Some((item_path, item_name, item_duration, item_kind, item_is_still, item_has_audio, item_waveform)) = self
+            .media
+            .iter()
+            .find(|item| item.id == media_id)
+            .map(|item| (item.path.clone(), item.name.clone(), item.duration, item.kind, item.is_still, item.has_audio, item.waveform.clone()))
+        else { return };
+        if (item_kind == Kind::Video) != track.is_video() {
             return;
         }
         self.push_undo();
         let id = format!("clip-{}", self.next_clip_id);
         self.next_clip_id += 1;
         let mut extra = HashMap::new();
-        extra.insert("path".to_owned(), serde_json::json!(item.path.to_string_lossy()));
-        extra.insert("kind".to_owned(), serde_json::json!(if item.kind == Kind::Video { "video" } else { "audio" }));
-        extra.insert("mediaKind".to_owned(), serde_json::json!(if item.is_still { "image" } else if item.kind == Kind::Video { "video" } else { "audio" }));
-        extra.insert("hasAudio".to_owned(), serde_json::json!(item.has_audio));
-        extra.insert("waveform".to_owned(), serde_json::json!(item.waveform.clone()));
-        extra.insert("sourceDuration".to_owned(), serde_json::json!(item.duration));
+        extra.insert("path".to_owned(), serde_json::json!(item_path.to_string_lossy()));
+        extra.insert("kind".to_owned(), serde_json::json!(if item_kind == Kind::Video { "video" } else { "audio" }));
+        extra.insert("mediaKind".to_owned(), serde_json::json!(if item_is_still { "image" } else if item_kind == Kind::Video { "video" } else { "audio" }));
+        extra.insert("hasAudio".to_owned(), serde_json::json!(item_has_audio));
+        extra.insert("waveform".to_owned(), serde_json::json!(item_waveform));
+        extra.insert("sourceDuration".to_owned(), serde_json::json!(item_duration));
         extra.insert("props".to_owned(), serde_json::json!({
             "transform": {
                 "scale": { "w": 100.0, "h": 100.0, "linked": true },
@@ -1297,8 +1304,8 @@ impl PlutoApp {
             id: id.clone(),
             track,
             start: start.max(0.0),
-            duration: item.duration.max(0.1),
-            label: item.name.clone(),
+            duration: item_duration.max(0.1),
+            label: item_name.clone(),
             linked_clip_id: None,
             extra,
         };
@@ -1401,7 +1408,7 @@ impl PlutoApp {
         let source_time = if is_still { 0.0 } else {
             (self.playhead - clip.start + clip.extra.get("sourceOffset").and_then(|value| value.as_f64()).unwrap_or(0.0)).max(0.0)
         };
-        let mut clip_value = serde_json::to_value(clip).unwrap_or(serde_json::Value::Null);
+        let mut clip_value = serde_json::to_value(&clip).unwrap_or(serde_json::Value::Null);
         clip_value["sourceOffset"] = serde_json::json!(0.0);
         let filter_graph = pluto_media_engine::preview_video_graph(&clip_value, PREVIEW_WIDTH as u32, PREVIEW_HEIGHT as u32, self.playhead);
         let fingerprint_graph = if self.playing {
@@ -2664,7 +2671,7 @@ impl PlutoApp {
         if content.contains(ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or(Pos2::new(-1.0, -1.0)))) {
             let (delta, shift) = ui.ctx().input(|i| (i.smooth_scroll_delta, i.modifiers.shift));
             if shift {
-                self.timeline_offset = (self.timeline_offset - (if delta.y.abs() > delta.x.abs() { delta.y } else { delta.x }) as f64 / pps.max(0.001)).max(0.0);
+                self.timeline_offset = (self.timeline_offset - (if delta.y.abs() > delta.x.abs() { delta.y } else { delta.x }) as f64 / f64::from(pps.max(0.001))).max(0.0);
             } else {
                 self.track_scroll = (self.track_scroll - delta.y).clamp(0.0, track_scroll_max);
             }
@@ -3097,17 +3104,27 @@ fn active_keyframe_index(clip: &Clip, local_time: f64, fps: f64) -> Option<usize
 }
 
 fn clip_property_store_mut(clip: &mut Clip, local_time: f64, fps: f64) -> &mut serde_json::Value {
-    if let Some(index) = active_keyframe_index(clip, local_time, fps) {
-        if let Some(keyframes) = clip.extra.get_mut("keyframes").and_then(serde_json::Value::as_array_mut) {
-            if let Some(keyframe) = keyframes.get_mut(index) {
-                if !keyframe.get("props").is_some_and(serde_json::Value::is_object) {
-                    keyframe["props"] = serde_json::json!({});
-                }
-                if let Some(props) = keyframe.get_mut("props") { return props; }
+    // Resolve which store to edit before taking any mutable borrow, so the
+    // keyframe borrow and the clip-level `props` borrow never overlap.
+    let keyframe_index = active_keyframe_index(clip, local_time, fps).filter(|&index| {
+        clip.extra
+            .get("keyframes")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|keyframes| index < keyframes.len())
+    });
+    match keyframe_index {
+        Some(index) => {
+            let keyframe = &mut clip.extra
+                .entry("keyframes".to_owned())
+                .or_insert_with(|| serde_json::json!([]))
+                [index];
+            if !keyframe.get("props").is_some_and(serde_json::Value::is_object) {
+                keyframe["props"] = serde_json::json!({});
             }
+            &mut keyframe["props"]
         }
+        None => clip.extra.entry("props".to_owned()).or_insert_with(|| serde_json::json!({})),
     }
-    clip.extra.entry("props".to_owned()).or_insert_with(|| serde_json::json!({}))
 }
 
 type EffectControl = (&'static str, &'static str, f64, f64, f64, &'static str);
