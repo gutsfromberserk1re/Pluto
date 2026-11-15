@@ -1,5 +1,5 @@
 use pluto_timeline_core::{Clip, Timeline, TrackId};
-use std::{fs, io::{BufRead, BufReader, Read}, path::{Path, PathBuf}, process::{Child, Command, Stdio}, sync::{Arc, Mutex}, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, hash::{Hash, Hasher}, io::{BufRead, BufReader, Read}, path::{Path, PathBuf}, process::{Child, Command, Stdio}, sync::{mpsc::{sync_channel, SyncSender}, Arc, Mutex, OnceLock}, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::{Emitter, State};
@@ -31,17 +31,47 @@ struct MediaAsset {
     waveform: Option<String>,
 }
 
+#[derive(Clone, Default)]
+struct DerivedMediaAssets {
+    thumbnail: Option<String>,
+    filmstrip: Option<String>,
+    waveform: Option<String>,
+}
+
+struct DerivedAssetCache {
+    entries: HashMap<String, DerivedMediaAssets>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl Default for DerivedAssetCache {
+    fn default() -> Self { Self { entries: HashMap::new(), order: VecDeque::new(), bytes: 0 } }
+}
+
+struct AssetJob { app: tauri::AppHandle, asset: MediaAsset, cache_key: String }
+
+const DERIVED_CACHE_LIMIT: usize = 32 * 1024 * 1024;
+const DERIVED_WORKER_COUNT: usize = 2;
+const DERIVED_QUEUE_CAPACITY: usize = 8;
+static DERIVED_ASSET_CACHE: OnceLock<Mutex<DerivedAssetCache>> = OnceLock::new();
+static PENDING_ASSET_JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static ASSET_JOB_SENDER: OnceLock<SyncSender<AssetJob>> = OnceLock::new();
+
 #[tauri::command]
 async fn import_media(app: tauri::AppHandle) -> Result<Option<MediaAsset>, String> {
     let Some(file) = app.dialog().file().add_filter("Media", &["mp4", "mov", "mkv", "avi", "webm", "m4v", "mp3", "wav", "m4a", "aac", "flac", "ogg", "png", "jpg", "jpeg", "webp", "gif"]).blocking_pick_file() else {
         return Ok(None);
     };
     let path = file.into_path().map_err(|error| error.to_string())?;
-    tauri::async_runtime::spawn_blocking(move || inspect_media(path))
-        .await.map_err(|error| error.to_string())?.map(Some)
+    let (asset, cache_key) = tauri::async_runtime::spawn_blocking(move || inspect_media(path))
+        .await.map_err(|error| error.to_string())??;
+    if let Some(cache_key) = cache_key {
+        enqueue_asset_job(AssetJob { app, asset: asset.clone(), cache_key }).await?;
+    }
+    Ok(Some(asset))
 }
 
-fn inspect_media(path: PathBuf) -> Result<MediaAsset, String> {
+fn inspect_media(path: PathBuf) -> Result<(MediaAsset, Option<String>), String> {
     if !path.is_file() { return Err("The selected media file could not be found".into()); }
     let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
     let kind = if ["png", "jpg", "jpeg", "webp", "gif"].contains(&extension.as_str()) { "image" }
@@ -69,13 +99,122 @@ fn inspect_media(path: PathBuf) -> Result<MediaAsset, String> {
             .or_else(|| metadata["streams"].as_array()?.iter().filter_map(|stream| as_seconds(&stream["duration"])).reduce(f64::max))
             .ok_or_else(|| "FFprobe did not report a usable media duration".to_owned())?;
     }
-    let thumbnail = if kind == "video" { ffmpeg_image_data(&path, duration) } else { None };
-    let filmstrip = if kind == "video" { ffmpeg_filmstrip_data(&path, duration) } else { None };
-    let waveform = if has_audio { ffmpeg_waveform_data(&path) } else { None };
-    Ok(MediaAsset {
+    let cache_key = derived_cache_key(&path);
+    let cached = cache_get(&cache_key).unwrap_or_default();
+    let needs_derived_assets = (kind == "video" && (cached.thumbnail.is_none() || cached.filmstrip.is_none()))
+        || (has_audio && cached.waveform.is_none());
+    let asset = MediaAsset {
         name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Media").to_owned(),
-        path: path.to_string_lossy().into_owned(), duration, kind: kind.into(), has_audio, thumbnail, filmstrip, waveform,
+        path: path.to_string_lossy().into_owned(), duration, kind: kind.into(), has_audio,
+        thumbnail: cached.thumbnail, filmstrip: cached.filmstrip, waveform: cached.waveform,
+    };
+    Ok((asset, needs_derived_assets.then_some(cache_key)))
+}
+
+fn derived_cache_key(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let metadata = fs::metadata(&canonical).ok();
+    let modified = metadata.as_ref().and_then(|value| value.modified().ok())
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_nanos()).unwrap_or(0);
+    let length = metadata.map(|value| value.len()).unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher); length.hash(&mut hasher); modified.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn cache_get(key: &str) -> Option<DerivedMediaAssets> {
+    let cache = DERIVED_ASSET_CACHE.get_or_init(|| Mutex::new(DerivedAssetCache::default()));
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = cache.entries.get(key).cloned();
+    if result.is_some() {
+        if let Some(index) = cache.order.iter().position(|entry| entry == key) { cache.order.remove(index); }
+        cache.order.push_back(key.to_owned());
+    }
+    result
+}
+
+fn cache_insert(key: String, assets: DerivedMediaAssets) {
+    let size = [&assets.thumbnail, &assets.filmstrip, &assets.waveform].into_iter()
+        .filter_map(|value| value.as_ref()).map(String::len).sum::<usize>();
+    if size == 0 || size > DERIVED_CACHE_LIMIT { return; }
+    let cache = DERIVED_ASSET_CACHE.get_or_init(|| Mutex::new(DerivedAssetCache::default()));
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(previous) = cache.entries.remove(&key) {
+        cache.bytes = cache.bytes.saturating_sub([&previous.thumbnail, &previous.filmstrip, &previous.waveform].into_iter()
+            .filter_map(|value| value.as_ref()).map(String::len).sum::<usize>());
+        if let Some(index) = cache.order.iter().position(|entry| entry == &key) { cache.order.remove(index); }
+    }
+    while cache.bytes + size > DERIVED_CACHE_LIMIT {
+        let Some(oldest) = cache.order.pop_front() else { break; };
+        if let Some(removed) = cache.entries.remove(&oldest) {
+            cache.bytes = cache.bytes.saturating_sub([&removed.thumbnail, &removed.filmstrip, &removed.waveform].into_iter()
+                .filter_map(|value| value.as_ref()).map(String::len).sum::<usize>());
+        }
+    }
+    cache.bytes += size;
+    cache.order.push_back(key.clone());
+    cache.entries.insert(key, assets);
+}
+
+fn asset_job_sender() -> &'static SyncSender<AssetJob> {
+    ASSET_JOB_SENDER.get_or_init(|| {
+        let (sender, receiver) = sync_channel::<AssetJob>(DERIVED_QUEUE_CAPACITY);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for worker_id in 0..DERIVED_WORKER_COUNT {
+            let worker_receiver = Arc::clone(&receiver);
+            let _ = thread::Builder::new().name(format!("pluto-media-assets-{worker_id}")).spawn(move || {
+                loop {
+                    let job = {
+                        let guard = worker_receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard.recv()
+                    };
+                    let Ok(job) = job else { break; };
+                    let mut asset = job.asset;
+                    let mut derived = cache_get(&job.cache_key).unwrap_or_default();
+                    if asset.kind == "video" {
+                        let (thumbnail, filmstrip) = ffmpeg_video_assets(Path::new(&asset.path), asset.duration);
+                        derived.thumbnail = derived.thumbnail.or(thumbnail);
+                        derived.filmstrip = derived.filmstrip.or(filmstrip);
+                    }
+                    if asset.has_audio {
+                        derived.waveform = derived.waveform.or_else(|| ffmpeg_waveform_data(Path::new(&asset.path)));
+                    }
+                    asset.thumbnail = derived.thumbnail.clone();
+                    asset.filmstrip = derived.filmstrip.clone();
+                    asset.waveform = derived.waveform.clone();
+                    cache_insert(job.cache_key.clone(), derived);
+                    let _ = job.app.emit("media-assets-ready", asset);
+                    if let Some(pending) = PENDING_ASSET_JOBS.get() {
+                        pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&job.cache_key);
+                    }
+                }
+            });
+        }
+        sender
     })
+}
+
+async fn enqueue_asset_job(job: AssetJob) -> Result<(), String> {
+    let pending = PENDING_ASSET_JOBS.get_or_init(|| Mutex::new(HashSet::new()));
+    {
+        let mut pending = pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending.insert(job.cache_key.clone()) { return Ok(()); }
+    }
+    let key = job.cache_key.clone();
+    let sender = asset_job_sender().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || sender.send(job)).await;
+    if !matches!(&result, Ok(Ok(()))) {
+        if let Some(pending) = PENDING_ASSET_JOBS.get() {
+            pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&key);
+        }
+        let message = match result {
+            Err(error) => error.to_string(),
+            Ok(Err(_)) => "Media asset processing workers are unavailable".into(),
+            Ok(Ok(())) => unreachable!(),
+        };
+        return Err(message);
+    }
+    Ok(())
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -93,27 +232,31 @@ fn base64_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn ffmpeg_image_data(path: &Path, duration: f64) -> Option<String> {
+fn ffmpeg_video_assets(path: &Path, duration: f64) -> (Option<String>, Option<String>) {
+    let temp = std::env::temp_dir().join(format!("pluto-assets-{}-{}", std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()));
+    if fs::create_dir(&temp).is_err() { return (None, None); }
+    let _cleanup = ExportTempFiles(temp.clone());
+    let thumbnail_path = temp.join("thumbnail.jpg");
+    let filmstrip_path = temp.join("filmstrip.png");
     let seek = format!("{:.3}", (duration * 0.15).clamp(0.0, (duration - 0.1).max(0.0)));
-    let output = Command::new(multimedia_binary("ffmpeg"))
-        .args(["-v", "error", "-ss", seek.as_str(), "-i"])
-        .arg(path)
-        .args(["-frames:v", "1", "-an", "-vf", "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2:color=black", "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "pipe:1"])
-        .output().ok()?;
-    if !output.status.success() || output.stdout.is_empty() { return None; }
-    Some(format!("data:image/jpeg;base64,{}", base64_encode(&output.stdout)))
-}
-
-fn ffmpeg_filmstrip_data(path: &Path, duration: f64) -> Option<String> {
     let frame_rate = format!("6/{duration:.5}");
-    let filter = format!("fps={frame_rate},scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2:color=black,tile=layout=6x1:nb_frames=6:padding=0:margin=0");
+    let filter = format!("[0:v]select='gte(t,{seek})',scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2:color=black[thumb];[0:v]fps={frame_rate},scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2:color=black,tile=layout=6x1:nb_frames=6:padding=0:margin=0[film]");
     let output = Command::new(multimedia_binary("ffmpeg"))
-        .args(["-v", "error", "-i"])
+        .args(["-y", "-v", "error", "-i"])
         .arg(path)
-        .args(["-an", "-vf", filter.as_str(), "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "pipe:1"])
-        .output().ok()?;
-    if !output.status.success() || output.stdout.is_empty() { return None; }
-    Some(format!("data:image/png;base64,{}", base64_encode(&output.stdout)))
+        .args(["-filter_complex", filter.as_str(), "-map", "[thumb]", "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "5"])
+        .arg(&thumbnail_path)
+        .args(["-map", "[film]", "-frames:v", "1", "-c:v", "png"])
+        .arg(&filmstrip_path)
+        .output();
+    let Ok(output) = output else { return (None, None); };
+    if !output.status.success() { return (None, None); }
+    let thumbnail = fs::read(thumbnail_path).ok().filter(|bytes| !bytes.is_empty())
+        .map(|bytes| format!("data:image/jpeg;base64,{}", base64_encode(&bytes)));
+    let filmstrip = fs::read(filmstrip_path).ok().filter(|bytes| !bytes.is_empty())
+        .map(|bytes| format!("data:image/png;base64,{}", base64_encode(&bytes)));
+    (thumbnail, filmstrip)
 }
 
 fn ffmpeg_waveform_data(path: &Path) -> Option<String> {
@@ -160,7 +303,7 @@ async fn export_timeline(app: tauri::AppHandle, timeline: State<'_, SharedTimeli
     let Some(file) = save.blocking_save_file() else { return Ok(None); };
     let mut output = file.into_path().map_err(|error| error.to_string())?;
     output.set_extension(format);
-    let timeline_clips = timeline.lock().map_err(|_| "Timeline lock failed".to_owned())?.clips.clone();
+    let timeline_clips = timeline.lock().map_err(|_| "Timeline lock failed".to_owned())?.clips().to_vec();
     let clips = timeline_clips.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
     let process = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || render_timeline(app, process, clips, settings, time, output))
@@ -177,6 +320,55 @@ fn cancel_export(state: State<'_, SharedExport>) -> Result<(), String> {
 fn number(value: &Value, key: &str, fallback: f64) -> f64 { value[key].as_f64().filter(|n| n.is_finite()).unwrap_or(fallback) }
 fn enabled(value: &Value, key: &str) -> bool { value[key]["enabled"].as_bool().unwrap_or(false) }
 fn n(value: &Value, key: &str, fallback: f64) -> f64 { number(value, key, fallback) }
+
+fn value_at_path<'a>(mut value: &'a Value, path: &[&str]) -> &'a Value {
+    for key in path { value = &value[*key]; }
+    value
+}
+
+fn keyframe_number_expr(clip: &Value, path: &[&str], fallback: f64, start: f64, time_var: &str) -> Option<String> {
+    let keyframes = clip["keyframes"].as_array()?;
+    if keyframes.is_empty() { return None; }
+    let base = value_at_path(&clip["props"], path).as_f64().filter(|n| n.is_finite()).unwrap_or(fallback);
+    let mut points = vec![(0.0_f64, base, "linear".to_owned())];
+    for keyframe in keyframes {
+        let Some(time) = keyframe["time"].as_f64().filter(|n| n.is_finite()) else { continue; };
+        if time < 0.0 || time > n(clip, "dur", f64::MAX) { continue; }
+        let Some(value) = value_at_path(&keyframe["props"], path).as_f64().filter(|n| n.is_finite()) else { continue; };
+        let easing = keyframe["easing"].as_str().unwrap_or("linear").to_owned();
+        if let Some(existing) = points.iter_mut().find(|point| (point.0 - time).abs() < 1e-6) {
+            *existing = (time, value, easing);
+        } else { points.push((time, value, easing)); }
+    }
+    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if points.is_empty() { return None; }
+    if points.len() == 1 {
+        return ((points[0].1 - base).abs() >= 1e-9).then(|| format!("{:.8}", points[0].1));
+    }
+    if points.windows(2).all(|pair| (pair[0].1 - pair[1].1).abs() < 1e-9) {
+        return ((points[0].1 - base).abs() >= 1e-9).then(|| format!("{:.8}", points[0].1));
+    }
+
+    let last = points.last()?.1;
+    let mut expression = format!("{last:.8}");
+    for index in (0..points.len() - 1).rev() {
+        let (from_time, from_value, easing) = &points[index];
+        let (to_time, to_value, _) = &points[index + 1];
+        let from_at = start + *from_time;
+        let to_at = start + *to_time;
+        let progress = format!("min(max(({time_var}-{from_at:.8})/{:.8},0),1)", (*to_time - *from_time).max(1e-6));
+        let eased = match easing.as_str() {
+            "ease-in" => format!("({progress})*({progress})"),
+            "ease-out" => format!("1-(1-({progress}))*(1-({progress}))"),
+            "ease-in-out" => format!("if(lt(({progress}),0.5),2*({progress})*({progress}),1-2*(1-({progress}))*(1-({progress})))"),
+            "hold" => "0".to_owned(),
+            _ => progress,
+        };
+        let interpolate = format!("({from_value:.8}+({to_value:.8}-{from_value:.8})*({eased}))");
+        expression = format!("if(lt({time_var},{from_at:.8}),{from_value:.8},if(lt({time_var},{to_at:.8}),{interpolate},{expression}))");
+    }
+    Some(expression)
+}
 
 fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
     let props = &clip["props"];
@@ -205,7 +397,24 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
     let brightness = (n(light, "exposure", 0.0) * 0.5 + n(light, "brightness", 0.0) / 100.0 * 0.25).clamp(-1.0, 1.0);
     let contrast = (1.0 + n(light, "contrast", 0.0) / 100.0 + n(detail, "clarity", 0.0) / 180.0).clamp(0.0, 4.0);
     let saturation = (1.0 + n(color, "saturation", 0.0) / 100.0 + n(color, "vibrance", 0.0) / 150.0).clamp(0.0, 3.0);
-    if brightness.abs() > 0.0001 || (contrast - 1.0).abs() > 0.0001 || (saturation - 1.0).abs() > 0.0001 {
+    let animated_color = keyframe_number_expr(clip, &["colors", "light", "exposure"], 0.0, start, "t").is_some()
+        || keyframe_number_expr(clip, &["colors", "light", "brightness"], 0.0, start, "t").is_some()
+        || keyframe_number_expr(clip, &["colors", "light", "contrast"], 0.0, start, "t").is_some()
+        || keyframe_number_expr(clip, &["colors", "detail", "clarity"], 0.0, start, "t").is_some()
+        || keyframe_number_expr(clip, &["colors", "color", "saturation"], 0.0, start, "t").is_some()
+        || keyframe_number_expr(clip, &["colors", "color", "vibrance"], 0.0, start, "t").is_some();
+    if animated_color {
+        let exposure = keyframe_number_expr(clip, &["colors", "light", "exposure"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "exposure", 0.0)));
+        let light_brightness = keyframe_number_expr(clip, &["colors", "light", "brightness"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "brightness", 0.0)));
+        let light_contrast = keyframe_number_expr(clip, &["colors", "light", "contrast"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "contrast", 0.0)));
+        let clarity = keyframe_number_expr(clip, &["colors", "detail", "clarity"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(detail, "clarity", 0.0)));
+        let color_saturation = keyframe_number_expr(clip, &["colors", "color", "saturation"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(color, "saturation", 0.0)));
+        let vibrance = keyframe_number_expr(clip, &["colors", "color", "vibrance"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(color, "vibrance", 0.0)));
+        let brightness_expr = format!("min(max(({exposure})*0.5+({light_brightness})/100*0.25,-1),1)");
+        let contrast_expr = format!("min(max(1+({light_contrast})/100+({clarity})/180,0),4)");
+        let saturation_expr = format!("min(max(1+({color_saturation})/100+({vibrance})/150,0),3)");
+        filters.push(format!("eq=brightness='{brightness_expr}':contrast='{contrast_expr}':saturation='{saturation_expr}':eval=frame"));
+    } else if brightness.abs() > 0.0001 || (contrast - 1.0).abs() > 0.0001 || (saturation - 1.0).abs() > 0.0001 {
         filters.push(format!("eq=brightness={brightness:.5}:contrast={contrast:.5}:saturation={saturation:.5}"));
     }
     let temperature = (n(color, "temperature", 0.0) / 100.0).clamp(-1.0, 1.0);
@@ -377,20 +586,39 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
 
     let scale_w = (n(&transform["scale"], "w", 100.0) / 100.0).clamp(0.01, 10.0);
     let scale_h = (n(&transform["scale"], "h", 100.0) / 100.0).clamp(0.01, 10.0);
-    if (scale_w - 1.0).abs() > 0.0001 || (scale_h - 1.0).abs() > 0.0001 { filters.push(format!("scale=iw*{scale_w:.5}:ih*{scale_h:.5}")); }
+    let scale_w_key = keyframe_number_expr(clip, &["transform", "scale", "w"], 100.0, start, "t");
+    let scale_h_key = keyframe_number_expr(clip, &["transform", "scale", "h"], 100.0, start, "t");
+    if scale_w_key.is_some() || scale_h_key.is_some() {
+        let w = scale_w_key.unwrap_or_else(|| format!("{:.8}", n(&transform["scale"], "w", 100.0)));
+        let h = scale_h_key.unwrap_or_else(|| format!("{:.8}", n(&transform["scale"], "h", 100.0)));
+        filters.push(format!("scale=w='iw*min(max(({w})/100,0.01),10)':h='ih*min(max(({h})/100,0.01),10)':eval=frame"));
+    } else if (scale_w - 1.0).abs() > 0.0001 || (scale_h - 1.0).abs() > 0.0001 {
+        filters.push(format!("scale=iw*{scale_w:.5}:ih*{scale_h:.5}"));
+    }
     let rotation = n(transform, "rotation", 0.0).to_radians();
-    if rotation.abs() > 0.0001 { filters.push(format!("rotate={rotation:.6}:ow=rotw(iw):oh=roth(ih):c=black@0")); }
+    if let Some(rotation_expr) = keyframe_number_expr(clip, &["transform", "rotation"], 0.0, start, "t") {
+        let diagonal = (f64::from(width).hypot(f64::from(height))).ceil() as u32;
+        filters.push(format!("rotate='({rotation_expr})*PI/180':ow={diagonal}:oh={diagonal}:c=black@0"));
+    } else if rotation.abs() > 0.0001 {
+        filters.push(format!("rotate={rotation:.6}:ow=rotw(iw):oh=roth(ih):c=black@0"));
+    }
     let opacity = (n(transform, "opacity", 100.0) / 100.0).clamp(0.0, 1.0);
-    if opacity < 0.999 { filters.push(format!("colorchannelmixer=aa={opacity:.4}")); }
+    if let Some(opacity_expr) = keyframe_number_expr(clip, &["transform", "opacity"], 100.0, start, "T") {
+        filters.push(format!("geq=a='alpha(X,Y)*min(max(({opacity_expr})/100,0),1)'"));
+    } else if opacity < 0.999 { filters.push(format!("colorchannelmixer=aa={opacity:.4}")); }
     let x = n(&transform["position"], "x", 0.0) * width as f64 / 1920.0;
     let y = n(&transform["position"], "y", 0.0) * height as f64 / 1080.0;
+    let x_expr = keyframe_number_expr(clip, &["transform", "position", "x"], 0.0, start, "t")
+        .map(|expr| format!("({expr})*{width}/1920")).unwrap_or_else(|| format!("{x:.3}"));
+    let y_expr = keyframe_number_expr(clip, &["transform", "position", "y"], 0.0, start, "t")
+        .map(|expr| format!("({expr})*{height}/1080")).unwrap_or_else(|| format!("{y:.3}"));
     let (shake_x, shake_y) = if enabled(effects, "shake") {
         let amount = n(&effects["shake"], "amount", 0.0) * width as f64 / 1920.0 * 0.18;
         let freq = (n(&effects["shake"], "frequency", 8.0) * (1.0 - n(&effects["shake"], "smoothness", 35.0) / 120.0)).max(0.5);
         (format!("+sin(2*PI*t*{freq:.3})*{amount:.3}"), format!("+cos(2*PI*t*{freq:.3})*{amount:.3}"))
     } else { (String::new(), String::new()) };
-    let overlay_x = format!("(main_w-overlay_w)/2+{x:.3}{shake_x}");
-    let overlay_y = format!("(main_h-overlay_h)/2+{y:.3}{shake_y}");
+    let overlay_x = format!("(main_w-overlay_w)/2+({x_expr}){shake_x}");
+    let overlay_y = format!("(main_h-overlay_h)/2+({y_expr}){shake_y}");
     (filters.join(","), overlay_x, overlay_y)
 }
 
@@ -400,7 +628,9 @@ fn audio_filters(clip: &Value, length: f64, total: f64) -> String {
     let effects = &props["effects"];
     let mut filters = vec![format!("atrim=start={:.5}:duration={length:.5}", n(clip, "sourceOffset", 0.0).max(0.0)), "asetpts=PTS-STARTPTS".into()];
     let volume = (n(audio, "volume", 100.0) / 100.0).clamp(0.0, 2.0);
-    if (volume - 1.0).abs() > 0.0001 { filters.push(format!("volume={volume:.4}")); }
+    if let Some(volume_expr) = keyframe_number_expr(clip, &["audio", "volume"], 100.0, 0.0, "t") {
+        filters.push(format!("volume='min(max(({volume_expr})/100,0),2)':eval=frame"));
+    } else if (volume - 1.0).abs() > 0.0001 { filters.push(format!("volume={volume:.4}")); }
     let pan = (n(audio, "pan", 0.0) / 100.0).clamp(-1.0, 1.0);
     if pan.abs() > 0.001 { filters.push(format!("stereotools=balance_out={pan:.4}")); }
     let bass = n(audio, "bass", 0.0); let treble = n(audio, "treble", 0.0);
@@ -456,6 +686,22 @@ fn render_timeline(app: tauri::AppHandle, process: SharedExport, clips: Vec<Valu
             && clip["path"].as_str().is_some()
             && (clip["mediaKind"].as_str() == Some("audio") || clip["hasAudio"].as_bool() == Some(true) || !clip["linkedAudioId"].is_null())
     }).collect() } else { Vec::new() };
+    let mut transition_ends_by_track: HashMap<String, Vec<(f64, usize, &Value)>> = HashMap::new();
+    let mut visual_starts_by_track: HashMap<String, Vec<f64>> = HashMap::new();
+    for (order, clip) in clips.iter().enumerate() {
+        let Some(track) = clip["track"].as_str() else { continue; };
+        if clip["trans"].is_object() {
+            transition_ends_by_track.entry(track.to_owned()).or_default()
+                .push((n(clip, "start", 0.0) + n(clip, "dur", 0.0), order, clip));
+        }
+        if clip["path"].as_str().is_some() && track.starts_with('v') {
+            visual_starts_by_track.entry(track.to_owned()).or_default().push(n(clip, "start", 0.0));
+        }
+    }
+    for neighbors in transition_ends_by_track.values_mut() {
+        neighbors.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
+    }
+    for starts in visual_starts_by_track.values_mut() { starts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)); }
     if visual.is_empty() && titles.is_empty() { return Err("Add imported media or a title clip to the timeline before exporting".into()); }
     if let Some(clip) = visual.iter().chain(audio.iter()).find(|clip| !PathBuf::from(clip["path"].as_str().unwrap_or_default()).is_file()) {
         return Err(format!("Media file is missing: {}", clip["path"].as_str().unwrap_or("(unknown)")));
@@ -481,16 +727,24 @@ fn render_timeline(app: tauri::AppHandle, process: SharedExport, clips: Vec<Valu
         let input = visual_inputs[index];
         let length = n(clip, "dur", 0.0).max(0.05);
         let start = n(clip, "start", 0.0).max(0.0);
-        let previous_transition = clips.iter().find(|other| other["id"] != clip["id"] && other["track"] == clip["track"]
-            && (n(other, "start", 0.0) + n(other, "dur", 0.0) - start).abs() < 0.05
-            && other["trans"].is_object()).map(|other| (other["trans"]["type"].as_str().unwrap_or("dissolve"), n(&other["trans"], "dur", 1.0)));
+        let track = clip["track"].as_str().unwrap_or_default();
+        let previous_transition = transition_ends_by_track.get(track).and_then(|neighbors| {
+            let first = neighbors.partition_point(|(end, _, _)| *end < start - 0.05);
+            neighbors[first..].iter().take_while(|(end, _, _)| *end < start + 0.05)
+                .filter(|(end, _, _)| (*end - start).abs() < 0.05)
+                .min_by_key(|(_, order, _)| *order)
+                .map(|(_, _, other)| (other["trans"]["type"].as_str().unwrap_or("dissolve"), n(&other["trans"], "dur", 1.0)))
+        });
         let end = start + length;
-        let next_transition = clips.iter().find(|other| other["id"] != clip["id"] && other["track"] == clip["track"]
-            && (n(other, "start", 0.0) - end).abs() < 0.05
-            && other["path"].as_str().is_some()).and_then(|_| {
-                let trans = &clip["trans"];
-                trans.is_object().then(|| (trans["type"].as_str().unwrap_or("dissolve"), n(trans, "dur", 1.0)))
-            });
+        let has_next = visual_starts_by_track.get(track).map(|starts| {
+            let first = starts.partition_point(|next_start| *next_start < end - 0.05);
+            starts[first..].iter().take_while(|next_start| **next_start < end + 0.05)
+                .any(|next_start| (*next_start - end).abs() < 0.05)
+        }).unwrap_or(false);
+        let next_transition = if has_next {
+            let trans = &clip["trans"];
+            trans.is_object().then(|| (trans["type"].as_str().unwrap_or("dissolve"), n(trans, "dur", 1.0)))
+        } else { None };
         let (filters, x, y) = video_filters(clip, width, height, start, length, previous_transition, next_transition);
         let raw = format!("visualraw{index}");
         let out = format!("visual{index}");
