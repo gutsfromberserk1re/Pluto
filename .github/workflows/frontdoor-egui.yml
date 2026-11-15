@@ -80,12 +80,18 @@ jobs:
         id: app-check
         continue-on-error: true
         shell: pwsh
-        run: cargo check --all-targets
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP/pluto-diagnostics" | Out-Null
+          cargo check --all-targets 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/pluto-diagnostics/app-check.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         working-directory: Frontdoor-egui
       - name: Run egui app tests
         id: app-test
         continue-on-error: true
-        run: cargo test --all-targets
+        shell: pwsh
+        run: |
+          cargo test --all-targets 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/pluto-diagnostics/app-test.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         working-directory: Frontdoor-egui
       - name: Check reusable Rust workspace
         id: core-check
@@ -100,7 +106,10 @@ jobs:
       - name: Build native egui app
         id: app-build
         continue-on-error: true
-        run: cargo build --release
+        shell: pwsh
+        run: |
+          cargo build --release 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/pluto-diagnostics/app-build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         working-directory: Frontdoor-egui
       - name: Validate bundled FFmpeg tools
         id: ffmpeg-check
@@ -143,6 +152,14 @@ jobs:
           name: Pluto-Portable-Windows
           if-no-files-found: warn
           path: Frontdoor-egui/target/release/Pluto-Portable-Windows.zip
+      - name: Upload Rust failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pluto-Rust-Diagnostics
+          path: ${{ runner.temp }}/pluto-diagnostics/*.log
+          if-no-files-found: warn
+
       - name: Summarize completed build checks
         if: always()
         shell: pwsh
