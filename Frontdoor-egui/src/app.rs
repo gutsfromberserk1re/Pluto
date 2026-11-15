@@ -2565,7 +2565,10 @@ impl PlutoApp {
         self.timeline_offset = self.timeline_offset.min(max_timeline_offset);
         self.timeline_content = content;
         self.track_hit_areas.clear();
-        let x_of = |t: f64| content.min.x + (t - self.timeline_offset) as f32 * pps;
+        // Pass the horizontal scroll offset explicitly. Capturing the field here
+        // would keep an immutable borrow of `self` alive while wheel and middle
+        // mouse gestures update the offset below.
+        let x_of = |t: f64, offset: f64| content.min.x + (t - offset) as f32 * pps;
 
         let step = if pps >= 90.0 {
             0.5
@@ -2578,7 +2581,7 @@ impl PlutoApp {
         };
         let mut t = (self.timeline_offset / step).floor() * step;
         while t <= self.timeline_offset + visible_seconds as f64 + step {
-            let px = x_of(t);
+            let px = x_of(t, self.timeline_offset);
             if px > content.max.x {
                 break;
             }
@@ -2732,8 +2735,8 @@ impl PlutoApp {
         for clip in &clips {
             let Some((_, row)) = self.track_hit_areas.iter().find(|(track_id, _)| *track_id == clip.track) else { continue };
             let clip_rect = Rect::from_min_max(
-                Pos2::new(x_of(clip.start), row.min.y + 5.0),
-                Pos2::new(x_of(clip.end()).max(x_of(clip.start) + 8.0), row.max.y - 5.0),
+                Pos2::new(x_of(clip.start, self.timeline_offset), row.min.y + 5.0),
+                Pos2::new(x_of(clip.end(), self.timeline_offset).max(x_of(clip.start, self.timeline_offset) + 8.0), row.max.y - 5.0),
             );
             if clip_rect.max.x < content.min.x || clip_rect.min.x > content.max.x { continue; }
             let selected = self.selected_clip.as_deref() == Some(clip.id.as_str()) || self.selected_clips.contains(&clip.id);
@@ -2766,7 +2769,7 @@ impl PlutoApp {
             if let Some(keyframes) = clip.extra.get("keyframes").and_then(serde_json::Value::as_array) {
                 for (key_index, keyframe) in keyframes.iter().enumerate() {
                     let Some(local_time) = keyframe["time"].as_f64().filter(|time| *time >= 0.0 && *time <= clip.duration) else { continue };
-                    let key_x = x_of(clip.start + local_time);
+                    let key_x = x_of(clip.start + local_time, self.timeline_offset);
                     if key_x < clip_rect.min.x || key_x > clip_rect.max.x { continue; }
                     let frame_id = (local_time * self.fps.max(1.0)).round() as i64;
                     let selection_id = (clip.id.clone(), frame_id);
@@ -2990,7 +2993,7 @@ impl PlutoApp {
         }
 
         // Playhead
-        let px = x_of(self.playhead);
+        let px = x_of(self.playhead, self.timeline_offset);
         if px >= content.min.x && px <= content.max.x {
             painter.rect_filled(
                 Rect::from_min_size(Pos2::new(px - 0.75, ruler.min.y + 4.0), Vec2::new(1.5, body.height() - 4.0)),
