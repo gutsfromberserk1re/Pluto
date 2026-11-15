@@ -138,7 +138,9 @@ pub fn draw(painter: &Painter, rect: Rect, name: &str, color: Color32) {
             continue;
         }
         match strip.dash {
-            None => painter.add(Shape::line(pts, stroke)),
+            None => {
+                painter.add(Shape::line(pts, stroke));
+            }
             Some((on, off)) => {
                 for seg in dash_segments(&pts, on * scale, off * scale) {
                     painter.add(Shape::line(seg, stroke));

@@ -21,7 +21,7 @@ use std::{
 
 use crate::{icons, theme};
 
-const LOGO_ICO: &[u8] = include_bytes!("../../Frontdoor/assets/pluto-icon.ico");
+const LOGO_ICO: &[u8] = include_bytes!("../../Icon/icon.ico");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -358,7 +358,7 @@ impl PlutoApp {
             input.key_pressed(egui::Key::H) && !input.modifiers.command,
             input.key_pressed(egui::Key::C) && !input.modifiers.command,
             input.key_pressed(egui::Key::T) && !input.modifiers.command,
-            ctx.wants_keyboard_input(),
+            ctx.egui_wants_keyboard_input(),
         ));
         if text_focus { return; }
         if space {
@@ -387,15 +387,22 @@ impl PlutoApp {
             let Some(id) = self.selected_clip.clone() else { self.selected_keyframes.clear(); return };
             let selected: HashSet<i64> = self.selected_keyframes.iter().filter(|(clip_id, _)| clip_id == &id).map(|(_, frame)| *frame).collect();
             let mut clips = self.timeline.clips().to_vec();
-            if let Some(clip) = clips.iter_mut().find(|clip| clip.id == id) {
+            let changed = if let Some(clip) = clips.iter_mut().find(|clip| clip.id == id) {
                 if let Some(keys) = clip.extra.get_mut("keyframes").and_then(serde_json::Value::as_array_mut) {
                     keys.retain(|key| !key["time"].as_f64().is_some_and(|time| selected.contains(&((time * self.fps.max(1.0)).round() as i64))));
-                    if let Ok(mut timeline) = Timeline::new(clips) {
-                        self.push_undo();
-                        timeline.snapping = self.magnet;
-                        self.timeline = timeline;
-                        self.selected_keyframes.clear();
-                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if changed {
+                if let Ok(mut timeline) = Timeline::new(clips) {
+                    self.push_undo();
+                    timeline.snapping = self.magnet;
+                    self.timeline = timeline;
+                    self.selected_keyframes.clear();
                 }
             }
             return;
@@ -1225,6 +1232,7 @@ impl PlutoApp {
                         id: raw.id,
                         path: raw.path,
                         name: raw.name,
+                        editing_name: false,
                         duration: raw.duration,
                         kind: raw.kind,
                         is_still: raw.is_still,
@@ -1341,17 +1349,17 @@ impl PlutoApp {
 }
 
 impl eframe::App for PlutoApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.tick(ctx);
-        self.refresh_preview(ctx);
-
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // egui 0.37 gives the application its root Ui directly. The root Ui
+        // replaces the old Context -> CentralPanel::show entry point.
+        let ctx = ui.ctx().clone();
+        self.tick(&ctx);
+        self.refresh_preview(&ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(theme::BG))
-            .show(ctx, |ui| {
-                self.shell(ui);
-            });
+            .show(ui, |ui| self.shell(ui));
         if self.show_export_settings && !self.export_busy {
-            self.export_settings_window(ctx);
+            self.export_settings_window(&ctx);
         }
     }
 }
@@ -1374,7 +1382,8 @@ impl PlutoApp {
         }
 
         let active = self.timeline.active_clips_at(self.playhead, None).into_iter()
-            .find(|clip| clip.track.is_video() && clip.extra.get("path").and_then(serde_json::Value::as_str).is_some());
+            .find(|clip| clip.track.is_video() && clip.extra.get("path").and_then(serde_json::Value::as_str).is_some())
+            .cloned();
         let Some(clip) = active else {
             if self.preview_request.as_ref().map(|request| request.0.as_str()) != Some("") {
                 self.preview_request_id = self.preview_request_id.wrapping_add(1);
@@ -1384,10 +1393,12 @@ impl PlutoApp {
             }
             return;
         };
-        let Some(path_text) = clip.extra.get("path").and_then(|value| value.as_str()) else { return };
-        let Some(media) = self.media.iter().find(|item| item.path.to_string_lossy() == path_text) else { return };
+        let Some(path_text) = clip.extra.get("path").and_then(|value| value.as_str()).map(str::to_owned) else { return };
+        let Some((media_path, is_still)) = self.media.iter()
+            .find(|item| item.path.to_string_lossy() == path_text)
+            .map(|item| (item.path.clone(), item.is_still)) else { return };
         let frame_slot = if self.playing { -1 } else { (self.playhead * self.fps.max(1.0)).round() as i64 };
-        let source_time = if media.is_still { 0.0 } else {
+        let source_time = if is_still { 0.0 } else {
             (self.playhead - clip.start + clip.extra.get("sourceOffset").and_then(|value| value.as_f64()).unwrap_or(0.0)).max(0.0)
         };
         let mut clip_value = serde_json::to_value(clip).unwrap_or(serde_json::Value::Null);
@@ -1406,7 +1417,7 @@ impl PlutoApp {
         if !self.playing {
             source_time.to_bits().hash(&mut filter_hash);
         }
-        let desired = (path_text.to_owned(), self.playing, frame_slot, filter_hash.finish());
+        let desired = (path_text, self.playing, frame_slot, filter_hash.finish());
         if self.preview_request.as_ref() == Some(&desired) { return; }
         let editing_while_playing = self.playing
             && self.last_edit_field.is_some()
@@ -1418,10 +1429,10 @@ impl PlutoApp {
         let request_id = self.preview_request_id;
         let _ = self.preview_commands.send(PreviewCommand::Decode {
             request_id,
-            path: media.path.clone(),
+            path: media_path,
             source_time,
             continuous: self.playing,
-            loop_image: media.is_still,
+            loop_image: is_still,
             filter_graph,
         });
     }
@@ -1674,7 +1685,7 @@ impl PlutoApp {
         }
         if name_resp.double_clicked() { self.editing_name = true; }
         if self.editing_name {
-            let response = ui.put(name_rect.shrink2(Vec2::new(8.0, 3.0)), egui::TextEdit::singleline(&mut self.name).frame(false));
+            let response = ui.put(name_rect.shrink2(Vec2::new(8.0, 3.0)), egui::TextEdit::singleline(&mut self.name).frame(egui::Frame::NONE));
             if name_resp.double_clicked() { response.request_focus(); }
             if response.lost_focus() && ui.ctx().input(|input| input.key_pressed(egui::Key::Enter)) { self.editing_name = false; }
         } else {
@@ -1738,7 +1749,7 @@ impl PlutoApp {
         ui: &mut Ui,
         painter: &egui::Painter,
         rect: Rect,
-        id: impl std::hash::Hash,
+        id: impl std::hash::Hash + std::fmt::Debug,
         icon: &str,
         icon_size: f32,
         tint: Color32,
@@ -1835,12 +1846,12 @@ impl PlutoApp {
             Rect::from_min_max(Pos2::new(search.min.x + 34.0, search.min.y + 2.0), search.max - Vec2::new(8.0, 2.0)),
             egui::TextEdit::singleline(&mut self.media_search)
                 .hint_text("Search media")
-                .frame(false),
+                .frame(egui::Frame::NONE),
         );
 
         let list = Rect::from_min_max(Pos2::new(inner.min.x, search.max.y + 10.0), inner.max);
         if list.contains(ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or(Pos2::new(-1.0, -1.0)))) {
-            let scroll = ui.ctx().input(|i| i.raw_scroll_delta.y);
+            let scroll = ui.ctx().input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 self.media_scroll = (self.media_scroll - scroll).max(0.0);
             }
@@ -2297,7 +2308,7 @@ impl PlutoApp {
             });
             if enabled {
                 for (key, title, min, max, default, unit) in controls {
-                    self.draw_slider(ui, title, &["effects", group, key], min, max, default, unit);
+                    self.draw_slider(ui, title, &["effects", group, key], *min, *max, *default, unit);
                 }
                 ui.add_space(8.0);
             }
@@ -2359,7 +2370,7 @@ impl PlutoApp {
         let mut value = self.property_number(path, default);
         let response = ui.horizontal(|ui| {
             ui.label(egui::RichText::new(label).color(theme::MUTED));
-            ui.add(egui::DragValue::new(&mut value).speed(0.5).suffix(unit));
+            ui.add(egui::DragValue::new(&mut value).speed(0.5).suffix(unit))
         }).inner;
         if response.changed() { self.set_number(path, value); }
     }
@@ -2368,20 +2379,28 @@ impl PlutoApp {
         let mut value = self.property_number(&["transform", "scale", axis], 100.0);
         let response = ui.horizontal(|ui| {
             ui.label(egui::RichText::new(label).color(theme::MUTED));
-            ui.add(egui::DragValue::new(&mut value).speed(0.5).suffix(" %"));
+            ui.add(egui::DragValue::new(&mut value).speed(0.5).suffix(" %"))
         }).inner;
         if response.changed() { self.set_scale_axis(axis, value); }
     }
 
     fn draw_slider(&mut self, ui: &mut Ui, label: &str, path: &[&str], min: f64, max: f64, default: f64, unit: &str) {
         let mut value = self.property_number(path, default) as f32;
-        let response = ui.horizontal(|ui| {
+        let changed = ui.horizontal(|ui| {
             ui.label(egui::RichText::new(label).color(theme::TEXT));
             let slider_width = (ui.available_width() - 70.0).max(48.0);
-            ui.add_sized([slider_width, 18.0], egui::Slider::new(&mut value, min as f32..=max as f32).show_value(false));
-            ui.add(egui::DragValue::new(&mut value).speed((max - min).abs() as f32 / 500.0).suffix(unit));
+            let slider = ui.add_sized(
+                [slider_width, 18.0],
+                egui::Slider::new(&mut value, min as f32..=max as f32).show_value(false),
+            );
+            let number = ui.add(
+                egui::DragValue::new(&mut value)
+                    .speed((max - min).abs() as f32 / 500.0)
+                    .suffix(unit),
+            );
+            slider.changed() || number.changed()
         }).inner;
-        if response.changed() { self.set_number(path, value as f64); }
+        if changed { self.set_number(path, value as f64); }
     }
 
     fn draw_text_field(&mut self, ui: &mut Ui, label: &str, path: &[&str]) {
@@ -2535,7 +2554,8 @@ impl PlutoApp {
 
         let pps = (content.width() / self.duration as f32) * self.zoom;
         let visible_seconds = content.width() / pps.max(0.001);
-        self.timeline_offset = self.timeline_offset.min((self.duration - visible_seconds).max(0.0) as f64);
+        let max_timeline_offset = (self.duration as f32 - visible_seconds).max(0.0) as f64;
+        self.timeline_offset = self.timeline_offset.min(max_timeline_offset);
         self.timeline_content = content;
         self.track_hit_areas.clear();
         let x_of = |t: f64| content.min.x + (t - self.timeline_offset) as f32 * pps;
@@ -2550,7 +2570,7 @@ impl PlutoApp {
             5.0
         };
         let mut t = (self.timeline_offset / step).floor() * step;
-        while t <= self.timeline_offset + visible_seconds + step {
+        while t <= self.timeline_offset + visible_seconds as f64 + step {
             let px = x_of(t);
             if px > content.max.x {
                 break;
@@ -2642,14 +2662,14 @@ impl PlutoApp {
 
         // Shift-wheel scrolls left/right. Regular wheel moves the lane stack.
         if content.contains(ui.ctx().input(|i| i.pointer.hover_pos().unwrap_or(Pos2::new(-1.0, -1.0)))) {
-            let (delta, shift) = ui.ctx().input(|i| (i.raw_scroll_delta, i.modifiers.shift));
+            let (delta, shift) = ui.ctx().input(|i| (i.smooth_scroll_delta, i.modifiers.shift));
             if shift {
                 self.timeline_offset = (self.timeline_offset - (if delta.y.abs() > delta.x.abs() { delta.y } else { delta.x }) as f64 / pps.max(0.001)).max(0.0);
             } else {
                 self.track_scroll = (self.track_scroll - delta.y).clamp(0.0, track_scroll_max);
             }
         }
-        self.timeline_offset = self.timeline_offset.min((self.duration - visible_seconds).max(0.0) as f64);
+        self.timeline_offset = self.timeline_offset.min((self.duration as f32 - visible_seconds).max(0.0) as f64);
 
         let (middle_pressed, middle_down, middle_released, pointer_pos) = ui.ctx().input(|i| (
             i.pointer.button_pressed(egui::PointerButton::Middle),
@@ -2664,7 +2684,7 @@ impl PlutoApp {
         }
         if middle_down {
             if let (Some((origin_x, origin_time)), Some(pos)) = (self.middle_pan_origin, pointer_pos) {
-                self.timeline_offset = (origin_time - (pos.x - origin_x) as f64 / pps.max(0.001) as f64).clamp(0.0, (self.duration - visible_seconds).max(0.0) as f64);
+                self.timeline_offset = (origin_time - (pos.x - origin_x) as f64 / pps.max(0.001) as f64).clamp(0.0, (self.duration as f32 - visible_seconds).max(0.0) as f64);
             }
         }
         if middle_released { self.middle_pan_origin = None; }
@@ -2683,7 +2703,7 @@ impl PlutoApp {
         if self.tool == Tool::Hand && primary_down {
             if let (Some((origin_x, origin_time)), Some(pos)) = (self.hand_pan_origin, primary_pos) {
                 self.timeline_offset = (origin_time - (pos.x - origin_x) as f64 / pps.max(0.001) as f64)
-                    .clamp(0.0, (self.duration - visible_seconds).max(0.0) as f64);
+                    .clamp(0.0, (self.duration as f32 - visible_seconds).max(0.0) as f64);
             }
         }
         if primary_released { self.hand_pan_origin = None; }

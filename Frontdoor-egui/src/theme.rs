@@ -300,7 +300,7 @@ pub fn install_fonts(ctx: &egui::Context) {
 
 /// Global egui style tuned to the stylesheet (no widget chrome, our own cursors).
 pub fn install_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.window_margin = egui::Margin::ZERO;
     style.visuals = egui::Visuals::dark();
@@ -309,5 +309,5 @@ pub fn install_style(ctx: &egui::Context) {
     style.visuals.override_text_color = Some(TEXT);
     style.visuals.selection.bg_fill = BLUE_SOFT;
     style.visuals.selection.stroke = Stroke::new(1.0, THUMB);
-    ctx.set_style(style);
+    ctx.set_style_of(egui::Theme::Dark, style);
 }
