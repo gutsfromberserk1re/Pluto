@@ -10,23 +10,26 @@ for comparison during the migration; the native build does not load it.
 - Custom Pluto title bar, library, preview/transport, inspector, and timeline
   panels using the existing theme tokens and icon set.
 - FFprobe based media metadata, FFmpeg thumbnails and real audio waveforms,
-  imported on a single background worker.
+  imported on a single background worker; GIFs are imported as animated video.
 - Timeline clips, lane expansion, drag/drop, snapping, razor split, scrubbing,
-  zoom/pan, frame stepping, and undo/redo.
-- Native FFmpeg preview for the active video clip and exported timeline, using
-  the shared media engine in `Backdoor/media-engine`.
+  cursor/hand tools, zoom/pan, frame stepping, and undo/redo.
+- Native FFmpeg preview for the active video clip, including its canvas,
+  transform/color/effect filters, mirror effect, and clip keyframe timing.
+- Native image and video export settings for PNG/JPEG/WebP/AVIF and
+  MP4/WebM/GIF, including quality, frame rate, audio, looping, metadata,
+  color-space, dimensions, and aspect-ratio lock.
 - Transform, color, effect, title, transition, and audio-detach controls write
   to the same clip properties consumed by the exporter.
 
 ## Migration status
 
-The shell and core editing path are in progress; this is not yet full behavior
-parity with the web editor. Multi-track preview compositing, synced audio
-playback, multi-selection/group workflows, complete keyframe editing, project
-save/load, and pixel-level styling of every inspector widget still need to be
-ported and validated. Exported effects and transitions are
-handled by the shared FFmpeg engine, but the preview does not yet composite
-every layer or transition in the same way as export.
+The egui shell and primary editing path are in place, but full behavior parity
+is not complete. The current live preview shows one active video layer at a
+time; multi-track compositing, title-layer preview, synced audio playback,
+project save/load, and final pixel-level widget polish remain outstanding.
+Some multi-selection, grouping, and keyframe operations are implemented but
+still need broader interaction testing. The shared FFmpeg engine still handles
+full-timeline export, including the stacked video/audio layers and transitions.
 
 ## Run
 

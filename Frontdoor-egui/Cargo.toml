@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 # Windowing + immediate mode UI.
 eframe = { version = "0.37", default-features = true }
+egui = "0.37"
 pluto-timeline-core = { path = "../Backdoor/timeline-core" }
 pluto-media-engine = { path = "../Backdoor/media-engine" }
 serde_json = "1"

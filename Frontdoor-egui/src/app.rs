@@ -1,9 +1,8 @@
-//! Editor shell: the `.ed` grid from app.css:413-425 plus its four regions.
+//! Native Pluto editor shell built with egui.
 //!
-//! Milestone 1 renders the real geometry and chrome (top bar, media column,
-//! preview + transport, inspector column, timeline with ruler/tracks) so the
-//! window is pixel-comparable with the web build. Panel *contents* and the
-//! clip/timeline engine land in the following milestones.
+//! The panel geometry, theme, and icon language follow the existing Frontdoor
+//! implementation. Editing state is backed by the shared timeline core, while
+//! media preview and export are handled by the shell-independent FFmpeg engine.
 
 use egui::{
     Align2, Color32, CornerRadius, FontId, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2,
@@ -62,13 +61,54 @@ struct RawMediaItem {
     waveform: Vec<f32>,
 }
 
+#[derive(Clone)]
+struct ExportSettings {
+    mode: String,
+    image_format: String,
+    image_quality: f64,
+    image_transparent: bool,
+    image_metadata: bool,
+    image_color_space: String,
+    video_format: String,
+    video_fps: u32,
+    video_quality: String,
+    video_audio: bool,
+    video_loop: bool,
+    width: u32,
+    height: u32,
+    lock_aspect: bool,
+    aspect_ratio: f64,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            mode: "image".to_owned(),
+            image_format: "png".to_owned(),
+            image_quality: 90.0,
+            image_transparent: false,
+            image_metadata: true,
+            image_color_space: "srgb".to_owned(),
+            video_format: "mp4".to_owned(),
+            video_fps: 30,
+            video_quality: "high".to_owned(),
+            video_audio: true,
+            video_loop: true,
+            width: 1920,
+            height: 1080,
+            lock_aspect: true,
+            aspect_ratio: 16.0 / 9.0,
+        }
+    }
+}
+
 enum ExportEvent {
     Progress(f64),
     Finished(Result<String, String>),
 }
 
 enum PreviewCommand {
-    Decode { request_id: u64, path: PathBuf, source_time: f64, continuous: bool, filter: String },
+    Decode { request_id: u64, path: PathBuf, source_time: f64, continuous: bool, loop_image: bool, filter_graph: String },
     Stop,
 }
 
@@ -127,6 +167,7 @@ enum InspectorTab {
 
 pub struct PlutoApp {
     name: String,
+    editing_name: bool,
     playing: bool,
     playhead: f64,
     duration: f64,
@@ -154,6 +195,7 @@ pub struct PlutoApp {
     timeline_offset: f64,
     track_scroll: f32,
     middle_pan_origin: Option<(f32, f64)>,
+    hand_pan_origin: Option<(f32, f64)>,
     clip_drag_origin: Option<ClipDrag>,
     clip_trim_drag: Option<ClipTrimDrag>,
     undo: Vec<Timeline>,
@@ -171,6 +213,8 @@ pub struct PlutoApp {
     export_events_rx: Receiver<ExportEvent>,
     export_busy: bool,
     export_progress: f64,
+    export_settings: ExportSettings,
+    show_export_settings: bool,
     preview_commands: Sender<PreviewCommand>,
     preview_frames: Receiver<PreviewFrame>,
     preview_texture: Option<egui::TextureHandle>,
@@ -240,6 +284,7 @@ impl PlutoApp {
             timeline_offset: 0.0,
             track_scroll: 0.0,
             middle_pan_origin: None,
+            hand_pan_origin: None,
             clip_drag_origin: None,
             clip_trim_drag: None,
             undo: Vec::new(),
@@ -257,6 +302,8 @@ impl PlutoApp {
             export_events_rx,
             export_busy: false,
             export_progress: 0.0,
+            export_settings: ExportSettings::default(),
+            show_export_settings: false,
             preview_commands,
             preview_frames,
             preview_texture: None,
@@ -295,7 +342,7 @@ impl PlutoApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (space, left, right, delete, undo, redo, home, end, add_keyframe, previous_keyframe, next_keyframe, text_focus) = ctx.input(|input| (
+        let (space, left, right, delete, undo, redo, home, end, add_keyframe, previous_keyframe, next_keyframe, cursor_tool, hand_tool, razor_tool, text_tool, text_focus) = ctx.input(|input| (
             input.key_pressed(egui::Key::Space),
             input.key_pressed(egui::Key::ArrowLeft),
             input.key_pressed(egui::Key::ArrowRight),
@@ -307,6 +354,10 @@ impl PlutoApp {
             input.key_pressed(egui::Key::K),
             input.modifiers.alt && input.key_pressed(egui::Key::ArrowLeft),
             input.modifiers.alt && input.key_pressed(egui::Key::ArrowRight),
+            input.key_pressed(egui::Key::V) && !input.modifiers.command,
+            input.key_pressed(egui::Key::H) && !input.modifiers.command,
+            input.key_pressed(egui::Key::C) && !input.modifiers.command,
+            input.key_pressed(egui::Key::T) && !input.modifiers.command,
             ctx.wants_keyboard_input(),
         ));
         if text_focus { return; }
@@ -322,6 +373,10 @@ impl PlutoApp {
         if add_keyframe { self.toggle_keyframe(); }
         if previous_keyframe { self.seek_keyframe(false); }
         if next_keyframe { self.seek_keyframe(true); }
+        if cursor_tool { self.tool = Tool::Cursor; }
+        if hand_tool { self.tool = Tool::Hand; }
+        if razor_tool { self.tool = Tool::Razor; }
+        if text_tool { self.tool = Tool::Text; self.inspector_tab = InspectorTab::Text; }
         if delete { self.delete_selected_clip(); }
         if undo { self.undo_timeline(); }
         if redo { self.redo_timeline(); }
@@ -710,27 +765,169 @@ impl PlutoApp {
             if let Err(error) = pluto_media_engine::cancel_export(&self.export_process) {
                 self.status = Some(error);
             }
-            return;
+        } else {
+            self.show_export_settings = true;
         }
+    }
+
+    fn export_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_export_settings;
+        let mut begin_export = false;
+        let mut close_window = false;
+        egui::Window::new("Export")
+            .id(egui::Id::new("pluto-export-settings"))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Output type").color(theme::MUTED));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.export_settings.mode, "video".to_owned(), "Video");
+                    ui.selectable_value(&mut self.export_settings.mode, "image".to_owned(), "Image");
+                });
+                ui.separator();
+                ui.label(egui::RichText::new("Format").color(theme::MUTED));
+                if self.export_settings.mode == "image" {
+                    egui::ComboBox::from_id_salt("pluto-export-image-format")
+                        .selected_text(self.export_settings.image_format.to_uppercase())
+                        .show_ui(ui, |ui| {
+                            for format in ["png", "jpg", "webp", "avif"] {
+                                ui.selectable_value(&mut self.export_settings.image_format, format.to_owned(), format.to_uppercase());
+                            }
+                        });
+                    if self.export_settings.image_format != "png" {
+                        ui.add(egui::Slider::new(&mut self.export_settings.image_quality, 1.0..=100.0).text("Image quality"));
+                    }
+                    if self.export_settings.image_format != "jpg" {
+                        ui.checkbox(&mut self.export_settings.image_transparent, "Transparent background");
+                    } else {
+                        self.export_settings.image_transparent = false;
+                    }
+                    ui.checkbox(&mut self.export_settings.image_metadata, "Include metadata");
+                    ui.horizontal(|ui| {
+                        ui.label("Color space");
+                        ui.selectable_value(&mut self.export_settings.image_color_space, "srgb".to_owned(), "sRGB");
+                        ui.selectable_value(&mut self.export_settings.image_color_space, "p3".to_owned(), "Display P3");
+                    });
+                } else {
+                    egui::ComboBox::from_id_salt("pluto-export-video-format")
+                        .selected_text(self.export_settings.video_format.to_uppercase())
+                        .show_ui(ui, |ui| {
+                            for format in ["mp4", "webm", "gif"] {
+                                ui.selectable_value(&mut self.export_settings.video_format, format.to_owned(), format.to_uppercase());
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("Frame rate");
+                        egui::ComboBox::from_id_salt("pluto-export-fps")
+                            .selected_text(format!("{} fps", self.export_settings.video_fps))
+                            .show_ui(ui, |ui| {
+                                for fps in [24, 30, 60] {
+                                    ui.selectable_value(&mut self.export_settings.video_fps, fps, format!("{fps} fps"));
+                                }
+                            });
+                    });
+                    if self.export_settings.video_format != "gif" {
+                        egui::ComboBox::from_id_salt("pluto-export-video-quality")
+                            .selected_text(format!("Quality: {}", self.export_settings.video_quality))
+                            .show_ui(ui, |ui| {
+                                for quality in ["low", "medium", "high", "max"] {
+                                    ui.selectable_value(&mut self.export_settings.video_quality, quality.to_owned(), quality.to_uppercase());
+                                }
+                            });
+                        ui.checkbox(&mut self.export_settings.video_audio, "Include audio");
+                    } else {
+                        ui.checkbox(&mut self.export_settings.video_loop, "Loop forever");
+                    }
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("Output size").color(theme::MUTED));
+                let mut width = self.export_settings.width;
+                let mut height = self.export_settings.height;
+                let mut lock_aspect = self.export_settings.lock_aspect;
+                let mut aspect_ratio = self.export_settings.aspect_ratio.max(0.01);
+                let mut width_changed = false;
+                let mut height_changed = false;
+                let mut lock_changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Width");
+                    width_changed = ui.add(egui::DragValue::new(&mut width).range(16..=7680).suffix(" px")).changed();
+                    lock_changed = ui.checkbox(&mut lock_aspect, "Lock ratio").changed();
+                    ui.label("Height");
+                    height_changed = ui.add(egui::DragValue::new(&mut height).range(16..=4320).suffix(" px")).changed();
+                });
+                if lock_changed && lock_aspect {
+                    aspect_ratio = width as f64 / height.max(1) as f64;
+                }
+                if lock_aspect {
+                    if width_changed {
+                        height = ((width as f64 / aspect_ratio).round() as u32).clamp(16, 4320);
+                    } else if height_changed {
+                        width = ((height as f64 * aspect_ratio).round() as u32).clamp(16, 7680);
+                    }
+                }
+                self.export_settings.width = width.clamp(16, 7680);
+                self.export_settings.height = height.clamp(16, 4320);
+                self.export_settings.lock_aspect = lock_aspect;
+                self.export_settings.aspect_ratio = aspect_ratio;
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() { close_window = true; }
+                    if ui.button(egui::RichText::new("Export").strong()).clicked() { begin_export = true; }
+                });
+            });
+        if close_window { open = false; }
+        self.show_export_settings = open;
+        if begin_export {
+            self.show_export_settings = false;
+            self.start_export();
+        }
+    }
+
+    fn start_export(&mut self) {
         if self.timeline.clips().is_empty() {
             self.status = Some("Add media to the timeline before exporting".to_owned());
             return;
         }
-        let Some(output) = rfd::FileDialog::new()
-            .add_filter("MP4 video", &["mp4"])
-            .set_file_name(format!("{}.mp4", safe_filename(&self.name)))
-            .save_file() else { return };
+        let settings = self.export_settings.clone();
+        let (extension, filter_name, filter_extensions) = if settings.mode == "image" {
+            (settings.image_format.clone(), "Image", vec![settings.image_format.as_str()])
+        } else {
+            (settings.video_format.clone(), "Video", vec![settings.video_format.as_str()])
+        };
+        let file_name = format!("{}.{}", safe_filename(&self.name), extension);
+        let mut dialog = rfd::FileDialog::new().add_filter(filter_name, &filter_extensions);
+        dialog = dialog.set_file_name(file_name);
+        let Some(output) = dialog.save_file() else { return };
 
         let clips = match self.timeline.clips().iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>() {
             Ok(clips) => clips,
             Err(error) => { self.status = Some(format!("Could not prepare export: {error}")); return; }
         };
-        let settings = serde_json::json!({
-            "mode": "video",
-            "size": { "width": 1920, "height": 1080 },
-            "video": { "fps": self.fps, "format": "mp4", "quality": "high", "audio": true },
+        let engine_settings = serde_json::json!({
+            "mode": settings.mode.clone(),
+            "size": { "width": settings.width, "height": settings.height },
+            "video": {
+                "fps": settings.video_fps,
+                "format": settings.video_format.clone(),
+                "quality": settings.video_quality.clone(),
+                "audio": settings.video_audio,
+                "loop": settings.video_loop
+            },
+            "image": {
+                "format": settings.image_format.clone(),
+                "quality": settings.image_quality,
+                "transparent": settings.image_transparent,
+                "metadata": settings.image_metadata,
+                "colorSpace": settings.image_color_space
+            },
             "output": { "name": self.name }
         });
+        let output_time = if settings.mode == "image" {
+            self.playhead.clamp(0.0, (self.project_duration - 1.0 / self.fps.max(1.0)).max(0.0))
+        } else {
+            0.0
+        };
         let events = self.export_events_tx.clone();
         let process = self.export_process.clone();
         let (progress_tx, progress_rx) = mpsc::channel();
@@ -742,9 +939,9 @@ impl PlutoApp {
         });
         self.export_busy = true;
         self.export_progress = 0.0;
-        self.status = Some("Exporting video…".to_owned());
+        self.status = Some(if settings.mode == "image" { "Exporting frame…" } else { "Exporting video…" }.to_owned());
         thread::spawn(move || {
-            let result = pluto_media_engine::render_timeline(process, clips, settings, 0.0, output, progress_tx);
+            let result = pluto_media_engine::render_timeline(process, clips, engine_settings, output_time, output, progress_tx);
             let _ = events.send(ExportEvent::Finished(result));
         });
     }
@@ -1153,6 +1350,9 @@ impl eframe::App for PlutoApp {
             .show(ctx, |ui| {
                 self.shell(ui);
             });
+        if self.show_export_settings && !self.export_busy {
+            self.export_settings_window(ctx);
+        }
     }
 }
 
@@ -1187,22 +1387,25 @@ impl PlutoApp {
         let Some(path_text) = clip.extra.get("path").and_then(|value| value.as_str()) else { return };
         let Some(media) = self.media.iter().find(|item| item.path.to_string_lossy() == path_text) else { return };
         let frame_slot = if self.playing { -1 } else { (self.playhead * self.fps.max(1.0)).round() as i64 };
-        if media.is_still {
-            let desired = (path_text.to_owned(), self.playing, frame_slot, 0);
-            if self.preview_request.as_ref() == Some(&desired) { return; }
-            self.preview_request = Some(desired);
-            self.preview_request_id = self.preview_request_id.wrapping_add(1);
-            self.preview_texture = media.thumbnail.clone();
-            let _ = self.preview_commands.send(PreviewCommand::Stop);
-            return;
-        }
-
-        let source_time = (self.playhead - clip.start + clip.extra.get("sourceOffset").and_then(|value| value.as_f64()).unwrap_or(0.0)).max(0.0);
+        let source_time = if media.is_still { 0.0 } else {
+            (self.playhead - clip.start + clip.extra.get("sourceOffset").and_then(|value| value.as_f64()).unwrap_or(0.0)).max(0.0)
+        };
         let mut clip_value = serde_json::to_value(clip).unwrap_or(serde_json::Value::Null);
         clip_value["sourceOffset"] = serde_json::json!(0.0);
-        let filter = pluto_media_engine::preview_video_filter(&clip_value, PREVIEW_WIDTH as u32, PREVIEW_HEIGHT as u32);
+        let filter_graph = pluto_media_engine::preview_video_graph(&clip_value, PREVIEW_WIDTH as u32, PREVIEW_HEIGHT as u32, self.playhead);
+        let fingerprint_graph = if self.playing {
+            // Keep the playback identity independent of the moving playhead;
+            // the active FFmpeg process already advances frames continuously.
+            pluto_media_engine::preview_video_graph(&clip_value, PREVIEW_WIDTH as u32, PREVIEW_HEIGHT as u32, clip.start)
+        } else {
+            filter_graph.clone()
+        };
         let mut filter_hash = std::collections::hash_map::DefaultHasher::new();
-        filter.hash(&mut filter_hash);
+        fingerprint_graph.hash(&mut filter_hash);
+        clip.extra.get("sourceOffset").and_then(serde_json::Value::as_f64).unwrap_or(0.0).to_bits().hash(&mut filter_hash);
+        if !self.playing {
+            source_time.to_bits().hash(&mut filter_hash);
+        }
         let desired = (path_text.to_owned(), self.playing, frame_slot, filter_hash.finish());
         if self.preview_request.as_ref() == Some(&desired) { return; }
         let editing_while_playing = self.playing
@@ -1218,7 +1421,8 @@ impl PlutoApp {
             path: media.path.clone(),
             source_time,
             continuous: self.playing,
-            filter,
+            loop_image: media.is_still,
+            filter_graph,
         });
     }
 
@@ -2465,10 +2669,30 @@ impl PlutoApp {
         }
         if middle_released { self.middle_pan_origin = None; }
 
-        // Scrub from the ruler, leaving clip hit targets independent.
+        let (primary_pressed, primary_down, primary_released, primary_pos) = ui.ctx().input(|i| (
+            i.pointer.button_pressed(egui::PointerButton::Primary),
+            i.pointer.button_down(egui::PointerButton::Primary),
+            i.pointer.button_released(egui::PointerButton::Primary),
+            i.pointer.interact_pos(),
+        ));
+        if self.tool == Tool::Hand && primary_pressed {
+            if let Some(pos) = primary_pos.filter(|pos| content.contains(*pos)) {
+                self.hand_pan_origin = Some((pos.x, self.timeline_offset));
+            }
+        }
+        if self.tool == Tool::Hand && primary_down {
+            if let (Some((origin_x, origin_time)), Some(pos)) = (self.hand_pan_origin, primary_pos) {
+                self.timeline_offset = (origin_time - (pos.x - origin_x) as f64 / pps.max(0.001) as f64)
+                    .clamp(0.0, (self.duration - visible_seconds).max(0.0) as f64);
+            }
+        }
+        if primary_released { self.hand_pan_origin = None; }
+
+        // Scrub with the cursor/razor tools; the Hand tool reserves left-drag for panning.
         let scrub = Rect::from_min_max(Pos2::new(content.min.x, ruler.min.y), content.max);
-        let resp = ui.interact(scrub, egui::Id::new("tl-scrub"), Sense::click_and_drag());
-        if resp.clicked() || resp.dragged() {
+        let scrub_sense = if self.tool == Tool::Hand { Sense::hover() } else { Sense::click_and_drag() };
+        let resp = ui.interact(scrub, egui::Id::new("tl-scrub"), scrub_sense);
+        if self.tool != Tool::Hand && (resp.clicked() || resp.dragged()) {
             if let Some(pos) = ui.ctx().pointer_interact_pos() {
                 let t = (self.timeline_offset as f32 + (pos.x - content.min.x) / pps.max(0.001)).clamp(0.0, self.duration as f32);
                 self.playhead = t as f64;
@@ -2527,7 +2751,8 @@ impl PlutoApp {
                         if is_selected_key { Color32::from_rgb(224, 193, 255) } else { Color32::from_rgb(147, 83, 205) },
                         Stroke::new(1.0, Color32::from_rgb(25, 19, 33)),
                     ));
-                    let key_response = ui.interact(diamond.expand(3.0), egui::Id::new(("timeline-keyframe", clip.id.as_str(), key_index)), Sense::click_and_drag());
+                    let key_sense = if self.tool == Tool::Cursor { Sense::click_and_drag() } else { Sense::hover() };
+                    let key_response = ui.interact(diamond.expand(3.0), egui::Id::new(("timeline-keyframe", clip.id.as_str(), key_index)), key_sense);
                     let easing = keyframe["easing"].as_str().unwrap_or("linear");
                     let mut easing_choice = None;
                     key_response.clone().context_menu(|menu| {
@@ -2598,7 +2823,8 @@ impl PlutoApp {
             }
             let offset = clip.extra.get("sourceOffset").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
             for (left_edge, handle) in [(true, left_trim), (false, right_trim)] {
-                let trim_response = ui.interact(handle, egui::Id::new(("timeline-trim", clip.id.as_str(), left_edge)), Sense::drag());
+                let trim_sense = if self.tool == Tool::Cursor { Sense::drag() } else { Sense::hover() };
+                let trim_response = ui.interact(handle, egui::Id::new(("timeline-trim", clip.id.as_str(), left_edge)), trim_sense);
                 if trim_response.drag_started() && !locked {
                     self.selected_clip = Some(clip.id.clone());
                     self.push_undo();
@@ -2672,7 +2898,7 @@ impl PlutoApp {
                         let at = self.timeline_offset + ((pos.x - content.min.x) / pps.max(0.001)) as f64;
                         self.split_clip_at(&clip.id, at);
                     }
-                } else {
+                } else if self.tool != Tool::Hand && self.tool != Tool::Text {
                     let shift = ui.ctx().input(|input| input.modifiers.shift);
                     if shift {
                         if self.selected_clips.remove(&clip.id) {
@@ -2778,14 +3004,15 @@ fn start_preview_worker(ctx: egui::Context) -> (Sender<PreviewCommand>, Receiver
         while let Some(command) = pending.take() {
             match command {
                 PreviewCommand::Stop => pending = command_rx.recv().ok(),
-                PreviewCommand::Decode { request_id, path, source_time, continuous, filter } => {
+                PreviewCommand::Decode { request_id, path, source_time, continuous, loop_image, filter_graph } => {
                     let time = format!("{:.5}", source_time.max(0.0));
                     let mut ffmpeg = Command::new(media_tool("ffmpeg"));
                     ffmpeg.args(["-hide_banner", "-loglevel", "error"]);
+                    if loop_image { ffmpeg.args(["-loop", "1", "-framerate", "30"]); }
                     if continuous { ffmpeg.arg("-re"); }
                     ffmpeg.args(["-ss", time.as_str(), "-i"]).arg(&path)
-                        .args(["-an", "-vf"]).arg(filter)
-                        .args(["-f", "rawvideo", "-pix_fmt", "rgb24"]);
+                        .args(["-filter_complex"]).arg(filter_graph)
+                        .args(["-map", "[out]", "-an", "-f", "rawvideo", "-pix_fmt", "rgba"]);
                     if !continuous { ffmpeg.args(["-frames:v", "1"]); }
                     ffmpeg.args(["pipe:1"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
 
@@ -2799,7 +3026,7 @@ fn start_preview_worker(ctx: egui::Context) -> (Sender<PreviewCommand>, Receiver
                         pending = command_rx.recv().ok();
                         continue;
                     };
-                    let mut raw = vec![0_u8; PREVIEW_WIDTH * PREVIEW_HEIGHT * 3];
+                    let mut raw = vec![0_u8; PREVIEW_WIDTH * PREVIEW_HEIGHT * 4];
                     let mut superseding = None;
                     loop {
                         match command_rx.try_recv() {
@@ -2812,9 +3039,7 @@ fn start_preview_worker(ctx: egui::Context) -> (Sender<PreviewCommand>, Receiver
                             Err(TryRecvError::Empty) => {}
                         }
                         if stdout.read_exact(&mut raw).is_err() { break; }
-                        let mut rgba = Vec::with_capacity(PREVIEW_WIDTH * PREVIEW_HEIGHT * 4);
-                        for rgb in raw.chunks_exact(3) { rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]); }
-                        if frame_tx.try_send(PreviewFrame { request_id, rgba }).is_ok() { ctx.request_repaint(); }
+                        if frame_tx.try_send(PreviewFrame { request_id, rgba: raw.clone() }).is_ok() { ctx.request_repaint(); }
                         if !continuous { break; }
                     }
                     let _ = child.kill();
@@ -2908,12 +3133,12 @@ fn load_media_item(id: u64, path: PathBuf) -> Result<RawMediaItem, String> {
         return Err(format!("Media file was not found: {}", path.display()));
     }
     let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
-    let is_still = ["png", "jpg", "jpeg", "webp", "gif"].contains(&extension.as_str());
+    let is_still = ["png", "jpg", "jpeg", "webp"].contains(&extension.as_str());
     let kind = if is_still {
         Kind::Video
     } else if ["mp3", "wav", "m4a", "aac", "flac", "ogg"].contains(&extension.as_str()) {
         Kind::Audio
-    } else if ["mp4", "mov", "mkv", "avi", "webm", "m4v"].contains(&extension.as_str()) {
+    } else if ["mp4", "mov", "mkv", "avi", "webm", "m4v", "gif"].contains(&extension.as_str()) {
         Kind::Video
     } else {
         return Err(format!("Unsupported media type: {}", path.display()));

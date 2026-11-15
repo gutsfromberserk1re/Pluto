@@ -94,7 +94,7 @@ fn keyframe_number_expr(clip: &Value, path: &[&str], fallback: f64, start: f64, 
     Some(expression)
 }
 
-fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
+fn video_filters_at(clip: &Value, width: u32, height: u32, start: f64, length: f64, keyframe_start: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
     let props = &clip["props"];
     let transform = &props["transform"];
     let effects = &props["effects"];
@@ -121,17 +121,17 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
     let brightness = (n(light, "exposure", 0.0) * 0.5 + n(light, "brightness", 0.0) / 100.0 * 0.25).clamp(-1.0, 1.0);
     let contrast = (1.0 + n(light, "contrast", 0.0) / 100.0).clamp(0.0, 4.0);
     let saturation = (1.0 + n(color, "saturation", 0.0) / 100.0 + n(color, "vibrance", 0.0) / 150.0).clamp(0.0, 3.0);
-    let animated_color = keyframe_number_expr(clip, &["colors", "light", "exposure"], 0.0, start, "t").is_some()
-        || keyframe_number_expr(clip, &["colors", "light", "brightness"], 0.0, start, "t").is_some()
-        || keyframe_number_expr(clip, &["colors", "light", "contrast"], 0.0, start, "t").is_some()
-        || keyframe_number_expr(clip, &["colors", "color", "saturation"], 0.0, start, "t").is_some()
-        || keyframe_number_expr(clip, &["colors", "color", "vibrance"], 0.0, start, "t").is_some();
+    let animated_color = keyframe_number_expr(clip, &["colors", "light", "exposure"], 0.0, keyframe_start, "t").is_some()
+        || keyframe_number_expr(clip, &["colors", "light", "brightness"], 0.0, keyframe_start, "t").is_some()
+        || keyframe_number_expr(clip, &["colors", "light", "contrast"], 0.0, keyframe_start, "t").is_some()
+        || keyframe_number_expr(clip, &["colors", "color", "saturation"], 0.0, keyframe_start, "t").is_some()
+        || keyframe_number_expr(clip, &["colors", "color", "vibrance"], 0.0, keyframe_start, "t").is_some();
     if animated_color {
-        let exposure = keyframe_number_expr(clip, &["colors", "light", "exposure"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "exposure", 0.0)));
-        let light_brightness = keyframe_number_expr(clip, &["colors", "light", "brightness"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "brightness", 0.0)));
-        let light_contrast = keyframe_number_expr(clip, &["colors", "light", "contrast"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "contrast", 0.0)));
-        let color_saturation = keyframe_number_expr(clip, &["colors", "color", "saturation"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(color, "saturation", 0.0)));
-        let vibrance = keyframe_number_expr(clip, &["colors", "color", "vibrance"], 0.0, start, "t").unwrap_or_else(|| format!("{:.8}", n(color, "vibrance", 0.0)));
+        let exposure = keyframe_number_expr(clip, &["colors", "light", "exposure"], 0.0, keyframe_start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "exposure", 0.0)));
+        let light_brightness = keyframe_number_expr(clip, &["colors", "light", "brightness"], 0.0, keyframe_start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "brightness", 0.0)));
+        let light_contrast = keyframe_number_expr(clip, &["colors", "light", "contrast"], 0.0, keyframe_start, "t").unwrap_or_else(|| format!("{:.8}", n(light, "contrast", 0.0)));
+        let color_saturation = keyframe_number_expr(clip, &["colors", "color", "saturation"], 0.0, keyframe_start, "t").unwrap_or_else(|| format!("{:.8}", n(color, "saturation", 0.0)));
+        let vibrance = keyframe_number_expr(clip, &["colors", "color", "vibrance"], 0.0, keyframe_start, "t").unwrap_or_else(|| format!("{:.8}", n(color, "vibrance", 0.0)));
         let brightness_expr = format!("min(max(({exposure})*0.5+({light_brightness})/100*0.25,-1),1)");
         let contrast_expr = format!("min(max(1+({light_contrast})/100,0),4)");
         let saturation_expr = format!("min(max(1+({color_saturation})/100+({vibrance})/150,0),3)");
@@ -324,8 +324,8 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
 
     let scale_w = (n(&transform["scale"], "w", 100.0) / 100.0).clamp(0.01, 10.0);
     let scale_h = (n(&transform["scale"], "h", 100.0) / 100.0).clamp(0.01, 10.0);
-    let scale_w_key = keyframe_number_expr(clip, &["transform", "scale", "w"], 100.0, start, "t");
-    let scale_h_key = keyframe_number_expr(clip, &["transform", "scale", "h"], 100.0, start, "t");
+    let scale_w_key = keyframe_number_expr(clip, &["transform", "scale", "w"], 100.0, keyframe_start, "t");
+    let scale_h_key = keyframe_number_expr(clip, &["transform", "scale", "h"], 100.0, keyframe_start, "t");
     if scale_w_key.is_some() || scale_h_key.is_some() {
         let w = scale_w_key.unwrap_or_else(|| format!("{:.8}", n(&transform["scale"], "w", 100.0)));
         let h = scale_h_key.unwrap_or_else(|| format!("{:.8}", n(&transform["scale"], "h", 100.0)));
@@ -334,21 +334,21 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
         filters.push(format!("scale=iw*{scale_w:.5}:ih*{scale_h:.5}"));
     }
     let rotation = n(transform, "rotation", 0.0).to_radians();
-    if let Some(rotation_expr) = keyframe_number_expr(clip, &["transform", "rotation"], 0.0, start, "t") {
+    if let Some(rotation_expr) = keyframe_number_expr(clip, &["transform", "rotation"], 0.0, keyframe_start, "t") {
         let diagonal = (f64::from(width).hypot(f64::from(height))).ceil() as u32;
         filters.push(format!("rotate='({rotation_expr})*PI/180':ow={diagonal}:oh={diagonal}:c=black@0"));
     } else if rotation.abs() > 0.0001 {
         filters.push(format!("rotate={rotation:.6}:ow=rotw(iw):oh=roth(ih):c=black@0"));
     }
     let opacity = (n(transform, "opacity", 100.0) / 100.0).clamp(0.0, 1.0);
-    if let Some(opacity_expr) = keyframe_number_expr(clip, &["transform", "opacity"], 100.0, start, "T") {
+    if let Some(opacity_expr) = keyframe_number_expr(clip, &["transform", "opacity"], 100.0, keyframe_start, "T") {
         filters.push(format!("geq=a='alpha(X,Y)*min(max(({opacity_expr})/100,0),1)'"));
     } else if opacity < 0.999 { filters.push(format!("colorchannelmixer=aa={opacity:.4}")); }
     let x = n(&transform["position"], "x", 0.0) * width as f64 / 1920.0;
     let y = n(&transform["position"], "y", 0.0) * height as f64 / 1080.0;
-    let x_expr = keyframe_number_expr(clip, &["transform", "position", "x"], 0.0, start, "t")
+    let x_expr = keyframe_number_expr(clip, &["transform", "position", "x"], 0.0, keyframe_start, "t")
         .map(|expr| format!("({expr})*{width}/1920")).unwrap_or_else(|| format!("{x:.3}"));
-    let y_expr = keyframe_number_expr(clip, &["transform", "position", "y"], 0.0, start, "t")
+    let y_expr = keyframe_number_expr(clip, &["transform", "position", "y"], 0.0, keyframe_start, "t")
         .map(|expr| format!("({expr})*{height}/1080")).unwrap_or_else(|| format!("{y:.3}"));
     let (shake_x, shake_y) = if enabled(effects, "shake") {
         let amount = n(&effects["shake"], "amount", 0.0) * width as f64 / 1920.0 * 0.18;
@@ -360,9 +360,55 @@ fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64,
     (filters.join(","), overlay_x, overlay_y)
 }
 
+fn video_filters(clip: &Value, width: u32, height: u32, start: f64, length: f64, transition_in: Option<(&str, f64)>, transition_out: Option<(&str, f64)>) -> (String, String, String) {
+    video_filters_at(clip, width, height, start, length, start, transition_in, transition_out)
+}
+
 pub fn preview_video_filter(clip: &Value, width: u32, height: u32) -> String {
     let duration = n(clip, "dur", 1.0).max(0.05);
     video_filters(clip, width, height, 0.0, duration, None, None).0
+}
+
+/// Build a complete single-clip preview graph, including the editor canvas,
+/// clip transforms, and the mirror effect. The input is `[0:v]` and the final
+/// composited frame is exposed as `[out]` for the native preview worker.
+pub fn preview_video_graph(clip: &Value, width: u32, height: u32, timeline_time: f64) -> String {
+    let clip_start = n(clip, "start", 0.0).max(0.0);
+    let duration = n(clip, "dur", 1.0).max(0.05);
+    let local_time = (timeline_time - clip_start).clamp(0.0, duration);
+    let preview_time = clip_start + local_time;
+    let remaining = (duration - local_time).max(0.05);
+    // The media input is already seeked to the current source frame. Rebase its
+    // timestamps to the playhead for animated FFmpeg filters, while keyframe
+    // expressions remain anchored to the original clip start.
+    let (filters, x, y) = video_filters_at(clip, width, height, preview_time, remaining, clip_start, None, None);
+    let effects = &clip["props"]["effects"];
+    let mirror = &effects["mirror"];
+    let mirror_mix = if enabled(effects, "mirror") {
+        (n(mirror, "blend", 100.0) / 100.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let mut graph = vec![format!("[0:v]{filters}[preview_raw]")];
+    if mirror_mix > 0.0 {
+        graph.push("[preview_raw]split=2[preview_normal][preview_mirrored]".to_owned());
+        graph.push(format!(
+            "[preview_mirrored]{}[preview_flipped]",
+            if mirror["axis"].as_str() == Some("vertical") { "vflip" } else { "hflip" }
+        ));
+        graph.push(format!(
+            "[preview_normal][preview_flipped]blend=all_expr='A*{:.4}+B*{mirror_mix:.4}'[preview_clip]",
+            1.0 - mirror_mix
+        ));
+    } else {
+        graph.push("[preview_raw]null[preview_clip]".to_owned());
+    }
+    graph.push(format!("color=c=black:s={width}x{height}:r=30,setpts=PTS+{preview_time:.8}/TB[preview_canvas]"));
+    graph.push(format!(
+        "[preview_canvas][preview_clip]overlay=x='{x}':y='{y}':shortest=1:eof_action=pass:format=auto[out]"
+    ));
+    graph.join(";")
 }
 
 fn audio_filters(clip: &Value, length: f64, total: f64) -> String {
@@ -647,3 +693,50 @@ pub fn render_timeline(process: SharedExport, clips: Vec<Value>, settings: Value
     }
 }
 
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    fn sample_clip() -> Value {
+        serde_json::json!({
+            "start": 4.0,
+            "dur": 6.0,
+            "sourceOffset": 0.0,
+            "props": {
+                "transform": {
+                    "scale": { "w": 100.0, "h": 100.0 },
+                    "position": { "x": 0.0, "y": 0.0 },
+                    "rotation": 0.0,
+                    "opacity": 100.0
+                },
+                "colors": {},
+                "effects": {}
+            }
+        })
+    }
+
+    #[test]
+    fn preview_graph_composites_the_seeked_frame_at_playhead_time() {
+        let graph = preview_video_graph(&sample_clip(), 640, 360, 7.0);
+        assert!(graph.contains("trim=start=0.00000:duration=3.00000"));
+        assert!(graph.contains("setpts=PTS-STARTPTS+7.00000/TB"));
+        assert!(graph.contains("setpts=PTS+7.00000000/TB"));
+        assert!(graph.contains("overlay="));
+        assert!(graph.contains("[out]"));
+    }
+
+    #[test]
+    fn preview_keyframes_remain_relative_to_the_original_clip_start() {
+        let mut clip = sample_clip();
+        clip["keyframes"] = serde_json::json!([
+            {
+                "time": 1.0,
+                "props": { "transform": { "position": { "x": 120.0 } } }
+            }
+        ]);
+        let graph = preview_video_graph(&clip, 640, 360, 5.5);
+        assert!(graph.contains("if(lt(t,4.00000000),0.00000000"));
+        assert!(graph.contains("if(lt(t,5.00000000)"));
+    }
+}
