@@ -12,9 +12,13 @@ path = "src/main.rs"
 [dependencies]
 # Windowing + immediate mode UI.
 eframe = { version = "0.37", default-features = true }
+pluto-timeline-core = { path = "../Backdoor/timeline-core" }
+pluto-media-engine = { path = "../Backdoor/media-engine" }
+serde_json = "1"
+rfd = "0.15"
 
 # Logo (.ico) decoding for the title bar mark.
-image = { version = "0.25", default-features = false, features = ["ico"] }
+image = { version = "0.25", default-features = false, features = ["ico", "png", "jpeg", "webp"] }
 
 [profile.release]
 opt-level = 3

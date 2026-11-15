@@ -20,7 +20,7 @@ cargo bench --manifest-path Backdoor/pixel-core/Cargo.toml --bench pixels > Back
 
 It reports five warmup iterations and seven measured samples per operation, and compares scalar RGBA/BGRA conversion with runtime dispatch on the same host. The conversion implementation only uses AVX2 or SSE2 after runtime checks; machines without either use the scalar reference. SSE4.1, AVX-only, and FMA variants are not included because no measurements currently justify maintaining those paths.
 
-The browser benchmark first smoke-checks preview, keyframe add/remove, clip move/trim/split/delete, and undo/redo. It then opens the actual Frontdoor in headless Chromium with deterministic timeline fixtures at 100, 500, and 1,000 clips. It times repeated preview renders after warmup using both the indexed active-candidate query and a linear scan over the same cached clip intervals, then reports mean, median, p95 render duration, and renders per second. This isolates the interval-query cost while holding rendering and compositing code constant. Install the pinned browser dependency and run it from the repository root:
+The legacy browser benchmark smoke-checks the web reference in headless Chromium and compares its indexed timeline queries with a linear scan. It is retained for historical comparison, but the active egui workflow no longer runs it. A native egui preview benchmark still needs to be added before preview performance can be compared across the two frontends. To run the legacy harness:
 
 ```powershell
 npm --prefix Backdoor/benchmarks install --no-package-lock --no-audit --no-fund
@@ -28,7 +28,7 @@ Backdoor/benchmarks/node_modules/.bin/playwright.cmd install chromium
 node Backdoor/benchmarks/preview.mjs > Backdoor/benchmarks/preview-latest.csv
 ```
 
-The media benchmark creates a synthetic 8-second 960×540 video with audio, then measures FFprobe metadata parsing, the production waveform FFmpeg graph, the thumbnail/filmstrip FFmpeg graph, and the combined metadata-plus-derived-assets import path. It includes subprocess and generated-asset base64 costs, but excludes Tauri queue wait time, WebView event delivery, and cache-hit latency. Run it with FFmpeg and FFprobe on `PATH`:
+The media benchmark creates a synthetic 8-second 960×540 video with audio, then measures FFprobe metadata parsing and FFmpeg waveform/thumbnail work. Its fixture still follows the older web import path, so it does not yet measure the egui import worker end to end. Run it with FFmpeg and FFprobe on `PATH`:
 
 ```powershell
 python Backdoor/benchmarks/media.py > Backdoor/benchmarks/media-latest.csv
@@ -45,9 +45,9 @@ Pluto does not set a global `target-cpu=native` flag. The timeline index uses sa
 - Timeline active clip lookup uses a per-track interval tree and returns clips in their original timeline order.
 - Timeline ID and adjacency lookups use indexes rebuilt lazily after mutations. Transition adjacency keeps the editor's strict 50 ms match tolerance and first-match behavior.
 - Preview candidates are queried from a cached interval tree. The existing transition and compositing calculations still decide which candidate layers are visible.
-- Native media metadata returns before thumbnail, filmstrip, and waveform generation. Derived work uses one worker on hosts with at most two logical CPUs and two otherwise, suppresses duplicate jobs, generates video thumbnails and filmstrips in one FFmpeg video pass, limits derived FFmpeg filter threads, and keeps an in-memory LRU capped at 32 MiB.
+- The legacy Tauri media path returned metadata before thumbnail, filmstrip, and waveform generation. The egui frontend now has one background import worker and generates bounded thumbnail and waveform images through FFmpeg; it does not yet reuse the legacy derived-asset LRU.
 - `pixel-core/` provides checked RGBA/BGRA views with explicit stride, scalar brightness/contrast, saturation, source-over blending, format conversion, and bilinear resizing. Format conversion dispatches to AVX2 or SSE2 only after runtime detection; no optional instruction is required by the baseline. The current editor has no native raw-frame path, so its FFmpeg export remains the active pixel-processing engine until an end-to-end benchmark demonstrates a benefit from integration.
 
 ## Results and limits
 
-The GitHub Actions workflow runs timeline and pixel Rust benchmarks, a headless Chromium preview benchmark, and fixture-backed FFprobe/FFmpeg media benchmarks, then uploads their CSV output. The timeline, pixel conversion, and browser preview harnesses compare optimized paths with linear or scalar references in the same build and on the same host; they are algorithmic comparisons, not historical build-to-build measurements. The media benchmark captures the FFmpeg work but not Tauri queue delay or cache-hit latency. No CPU-feature-restricted virtual machines were available here. The current environment does not have Cargo, npm, or a local browser installed, so Rust tests, release builds, browser benchmarks, and Rust benchmark executables have not been run here. JavaScript syntax checks are available and have passed.
+The Linux workflow runs timeline and pixel Rust benchmarks plus the fixture-backed FFmpeg media benchmark and uploads CSV output. The Windows workflow checks and builds the egui application. The native preview benchmark and full media-import benchmark remain open work. No benchmark results are claimed from this checkout: the local Rustup installation has no configured default toolchain, so local Rust checks, release builds, and benchmark executables have not run.

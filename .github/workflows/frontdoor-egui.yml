@@ -1,4 +1,4 @@
-name: Frontdoor (egui)
+name: Pluto native egui
 
 on:
   push:
@@ -6,49 +6,150 @@ on:
     paths:
       - "Frontdoor-egui/**"
       - "Backdoor/timeline-core/**"
+      - "Backdoor/media-engine/**"
+      - "Backdoor/Cargo.toml"
       - ".github/workflows/frontdoor-egui.yml"
   pull_request:
     paths:
       - "Frontdoor-egui/**"
       - "Backdoor/timeline-core/**"
+      - "Backdoor/media-engine/**"
+      - "Backdoor/Cargo.toml"
       - ".github/workflows/frontdoor-egui.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    name: Build (windows)
+    name: Checks and portable Windows build
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: Frontdoor-egui
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: Frontdoor-egui
-
-      # The UI code is written without a local toolchain, so the first passes of
-      # this workflow are the compile feedback loop. Diagnostics are surfaced but
-      # do not fail the run until the tree is warning-clean.
-      - name: cargo check
-        run: cargo check --all-targets 2>&1 | Tee-Object -FilePath check.log
+      - uses: dtolnay/rust-toolchain@stable
+        id: rust-toolchain
         continue-on-error: true
-
-      - name: Show diagnostics
-        if: always()
-        run: Get-Content check.log -Tail 200
-
-      - name: cargo build (release)
-        run: cargo build --release
-
-      - name: Upload portable binary
-        uses: actions/upload-artifact@v4
+      - uses: Swatinem/rust-cache@v2
+        id: rust-cache
+        continue-on-error: true
         with:
-          name: pluto-frontdoor-windows
-          path: Frontdoor-egui/target/release/pluto-frontdoor.exe
+          workspaces: |
+            Frontdoor-egui -> Frontdoor-egui/target
+            Backdoor -> Backdoor/target
+
+      - name: Restore cached FFmpeg tools
+        id: ffmpeg-cache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: Backdoor/media-engine/ffmpeg
+          key: ffmpeg-windows-x64-chocolatey-v1
+      - name: Install FFmpeg
+        id: ffmpeg-install
+        continue-on-error: true
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: choco install ffmpeg --yes --no-progress
+      - name: Stage portable FFmpeg tools
+        id: ffmpeg-stage
+        continue-on-error: true
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ffmpegBundle = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/media-engine/ffmpeg'
+          New-Item -ItemType Directory -Force -Path $ffmpegBundle | Out-Null
+          $ffmpegExe = Get-ChildItem (Join-Path $env:ChocolateyInstall 'lib/ffmpeg') -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+          $ffprobeExe = Get-ChildItem (Join-Path $env:ChocolateyInstall 'lib/ffmpeg') -Filter ffprobe.exe -Recurse | Select-Object -First 1
+          if (-not $ffmpegExe -or -not $ffprobeExe) { throw 'FFmpeg executables were not found after installation.' }
+          Copy-Item $ffmpegExe.FullName $ffmpegBundle
+          Copy-Item $ffprobeExe.FullName $ffmpegBundle
+          @($ffmpegExe.Directory.FullName, $ffprobeExe.Directory.FullName) | Select-Object -Unique | ForEach-Object {
+            Get-ChildItem $_ -Filter '*.dll' | Copy-Item -Destination $ffmpegBundle
+          }
+      - name: Cache FFmpeg tools
+        id: ffmpeg-cache-save
+        continue-on-error: true
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true' && steps.ffmpeg-stage.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: Backdoor/media-engine/ffmpeg
+          key: ffmpeg-windows-x64-chocolatey-v1
+
+      - name: Check egui app and media engine
+        id: app-check
+        continue-on-error: true
+        shell: pwsh
+        run: cargo check --all-targets
+        working-directory: Frontdoor-egui
+      - name: Run egui app tests
+        id: app-test
+        continue-on-error: true
+        run: cargo test --all-targets
+        working-directory: Frontdoor-egui
+      - name: Check reusable Rust workspace
+        id: core-check
+        continue-on-error: true
+        run: cargo check --workspace
+        working-directory: Backdoor
+      - name: Test reusable Rust workspace
+        id: core-test
+        continue-on-error: true
+        run: cargo test --workspace
+        working-directory: Backdoor
+      - name: Build native egui app
+        id: app-build
+        continue-on-error: true
+        run: cargo build --release
+        working-directory: Frontdoor-egui
+      - name: Validate bundled FFmpeg tools
+        id: ffmpeg-check
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ffmpegDirectory = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/media-engine/ffmpeg'
+          foreach ($tool in @('ffmpeg.exe', 'ffprobe.exe')) {
+            if (-not (Test-Path (Join-Path $ffmpegDirectory $tool))) { throw "Missing bundled tool: $tool" }
+          }
+      - name: Package portable Pluto
+        id: package
+        if: always() && steps.app-build.outcome == 'success' && steps.ffmpeg-check.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $packageRoot = Join-Path $env:RUNNER_TEMP 'Pluto-Portable-Windows'
+          $runtimeFfmpeg = Join-Path $packageRoot 'ffmpeg'
+          $sourceFfmpeg = Join-Path $env:GITHUB_WORKSPACE 'Backdoor/media-engine/ffmpeg'
+          $releaseExe = Join-Path $env:GITHUB_WORKSPACE 'Frontdoor-egui/target/release/pluto-frontdoor.exe'
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE 'Frontdoor-egui/target/release/Pluto-Portable-Windows.zip'
+          New-Item -ItemType Directory -Force -Path $runtimeFfmpeg | Out-Null
+          Copy-Item $releaseExe (Join-Path $packageRoot 'Pluto.exe')
+          Copy-Item (Join-Path $sourceFfmpeg 'ffmpeg.exe') $runtimeFfmpeg
+          Copy-Item (Join-Path $sourceFfmpeg 'ffprobe.exe') $runtimeFfmpeg
+          Get-ChildItem $sourceFfmpeg -Filter '*.dll' | Copy-Item -Destination $runtimeFfmpeg
+          @(
+            'Pluto portable preview'
+            ''
+            'Unzip the archive and run Pluto.exe. Keep the ffmpeg folder beside Pluto.exe.'
+            'This build uses the native egui interface and does not need a browser runtime.'
+          ) | Set-Content -Path (Join-Path $packageRoot 'README.txt') -Encoding utf8
+          Compress-Archive -Path (Join-Path $packageRoot '*') -DestinationPath $zipPath -Force
+      - uses: actions/upload-artifact@v4
+        id: upload
+        if: always() && steps.package.outcome == 'success'
+        continue-on-error: true
+        with:
+          name: Pluto-Portable-Windows
           if-no-files-found: warn
+          path: Frontdoor-egui/target/release/Pluto-Portable-Windows.zip
+      - name: Summarize completed build checks
+        if: always()
+        shell: pwsh
+        env:
+          CHECK_OUTCOMES: ${{ steps.rust-toolchain.outcome }},${{ steps.rust-cache.outcome }},${{ steps.ffmpeg-install.outcome }},${{ steps.ffmpeg-stage.outcome }},${{ steps.ffmpeg-cache-save.outcome }},${{ steps.app-check.outcome }},${{ steps.app-test.outcome }},${{ steps.core-check.outcome }},${{ steps.core-test.outcome }},${{ steps.app-build.outcome }},${{ steps.ffmpeg-check.outcome }},${{ steps.package.outcome }},${{ steps.upload.outcome }}
+        run: |
+          Write-Output "Build check outcomes: $env:CHECK_OUTCOMES"
+          if ($env:CHECK_OUTCOMES -match '(^|,)failure(,|$)') {
+            throw 'One or more checks failed; all requested build and test steps were still allowed to finish.'
+          }

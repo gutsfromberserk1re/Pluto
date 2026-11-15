@@ -1,8 +1,8 @@
 //! Pluto — native egui frontend.
 //!
-//! This crate is a 1:1 re-implementation of the `Frontdoor` web UI
-//! (index.html + styles/app.css + scripts/app.js) on top of egui, so the
-//! editor runs natively instead of inside a Tauri webview.
+//! Native egui migration of the `Frontdoor` web editor. The Frontdoor files
+//! remain the visual and behavior reference while the native editing surface
+//! is brought to feature parity.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

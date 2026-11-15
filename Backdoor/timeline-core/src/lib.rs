@@ -349,6 +349,27 @@ impl Timeline {
         if at <= left.start + EPSILON || at >= left.end() - EPSILON {
             return Err(TimelineError::InvalidRange);
         }
+        let split_offset = at - left.start;
+        let mut right_extra = left.extra.clone();
+        let source_offset = right_extra.get("sourceOffset").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        if right_extra.contains_key("sourceOffset") || right_extra.contains_key("path") {
+            right_extra.insert("sourceOffset".into(), serde_json::json!(source_offset + split_offset));
+        }
+        if let Some(keyframes) = left.extra.get_mut("keyframes").and_then(serde_json::Value::as_array_mut) {
+            let mut left_keys = Vec::new();
+            let mut right_keys = Vec::new();
+            for mut keyframe in std::mem::take(keyframes) {
+                let Some(time) = keyframe["time"].as_f64() else { continue };
+                if time <= split_offset + EPSILON { left_keys.push(keyframe.clone()); }
+                if time >= split_offset - EPSILON {
+                    keyframe["time"] = serde_json::json!((time - split_offset).max(0.0));
+                    right_keys.push(keyframe);
+                }
+            }
+            left.extra.insert("keyframes".into(), serde_json::Value::Array(left_keys));
+            right_extra.insert("keyframes".into(), serde_json::Value::Array(right_keys));
+        }
+        left.extra.remove("trans");
         let right = Clip {
             id: right_id,
             track: left.track,
@@ -356,7 +377,7 @@ impl Timeline {
             duration: left.end() - at,
             label: left.label.clone(),
             linked_clip_id: None,
-            extra: left.extra.clone(),
+            extra: right_extra,
         };
         left.duration = at - left.start;
         self.replace(left.clone());
@@ -478,6 +499,32 @@ mod tests {
         assert_eq!(timeline.active_clips_at(6.5, Some(TrackId::V1))[0].id.as_str(), "d");
         timeline.delete_clip("d").unwrap();
         assert!(timeline.active_clips_at(6.5, Some(TrackId::V1)).is_empty());
+    }
+
+    #[test]
+    fn split_rebases_source_offset_keyframes_and_outgoing_transition() {
+        let mut source = clip("source", TrackId::V1, 2.0, 10.0);
+        source.extra.insert("path".into(), serde_json::json!("media.mp4"));
+        source.extra.insert("sourceOffset".into(), serde_json::json!(3.0));
+        source.extra.insert("trans".into(), serde_json::json!({"type":"dissolve","dur":0.5}));
+        source.extra.insert("keyframes".into(), serde_json::json!([
+            {"time":1.0,"props":{"transform":{"opacity":80.0}},"easing":"linear"},
+            {"time":5.0,"props":{"transform":{"opacity":50.0}},"easing":"ease-in"},
+            {"time":8.0,"props":{"transform":{"opacity":20.0}},"easing":"hold"}
+        ]));
+        let mut timeline = Timeline::new(vec![source]).unwrap();
+
+        let (left, right) = timeline.split_clip("source", 7.0, "right".into()).unwrap();
+
+        assert_eq!(left.duration, 5.0);
+        assert_eq!(right.duration, 5.0);
+        assert_eq!(right.extra["sourceOffset"], serde_json::json!(8.0));
+        assert!(!left.extra.contains_key("trans"));
+        assert_eq!(right.extra["trans"]["type"], "dissolve");
+        assert_eq!(left.extra["keyframes"].as_array().unwrap().len(), 2);
+        assert_eq!(right.extra["keyframes"].as_array().unwrap().len(), 2);
+        assert_eq!(right.extra["keyframes"][0]["time"], 0.0);
+        assert_eq!(right.extra["keyframes"][1]["time"], 3.0);
     }
 
     #[test]

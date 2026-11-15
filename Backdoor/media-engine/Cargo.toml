@@ -1,0 +1,9 @@
+[package]
+name = "pluto-media-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Shell independent FFmpeg media processing for Pluto"
+
+[dependencies]
+serde_json = "1"
+
