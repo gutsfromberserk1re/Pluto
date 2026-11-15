@@ -54,7 +54,6 @@ struct AssetJob { app: tauri::AppHandle, asset: MediaAsset, cache_key: String }
 const DERIVED_CACHE_LIMIT: usize = 32 * 1024 * 1024;
 const DERIVED_QUEUE_CAPACITY: usize = 8;
 const WAVEFORM_FILTER: &str = include_str!("../../../media-filters/waveform.txt");
-const VIDEO_ASSET_FILTER: &str = include_str!("../../../media-filters/video-assets.txt");
 static DERIVED_ASSET_CACHE: OnceLock<Mutex<DerivedAssetCache>> = OnceLock::new();
 static PENDING_ASSET_JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static ASSET_JOB_SENDER: OnceLock<SyncSender<AssetJob>> = OnceLock::new();
@@ -243,30 +242,24 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 fn ffmpeg_video_assets(path: &Path, duration: f64) -> (Option<String>, Option<String>) {
-    let temp = std::env::temp_dir().join(format!("pluto-assets-{}-{}", std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()));
-    if fs::create_dir(&temp).is_err() { return (None, None); }
-    let _cleanup = ExportTempFiles(temp.clone());
-    let thumbnail_path = temp.join("thumbnail.jpg");
-    let filmstrip_path = temp.join("filmstrip.png");
     let seek = format!("{:.3}", (duration * 0.15).clamp(0.0, (duration - 0.1).max(0.0)));
     let frame_rate = format!("{:.5}", 6.0 / duration.max(0.001));
-    let filter = VIDEO_ASSET_FILTER.replace("{seek}", &seek).replace("{frame_rate}", &frame_rate);
-    let output = Command::new(multimedia_binary("ffmpeg"))
-        .args(["-y", "-v", "error", "-threads", "1", "-i"])
+    let thumbnail = Command::new(multimedia_binary("ffmpeg"))
+        .args(["-v", "error", "-threads", "1", "-ss", seek.as_str(), "-i"])
         .arg(path)
-        .args(["-filter_complex_threads", "1", "-filter_complex", filter.as_str(), "-map", "[thumb]", "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "5"])
-        .arg(&thumbnail_path)
-        .args(["-map", "[film]", "-frames:v", "1", "-c:v", "png"])
-        .arg(&filmstrip_path)
-        .output();
-    let Ok(output) = output else { return (None, None); };
-    if !output.status.success() { return (None, None); }
-    let thumbnail = fs::read(thumbnail_path).ok().filter(|bytes| !bytes.is_empty())
-        .map(|bytes| format!("data:image/jpeg;base64,{}", base64_encode(&bytes)));
-    let filmstrip = fs::read(filmstrip_path).ok().filter(|bytes| !bytes.is_empty())
-        .map(|bytes| format!("data:image/png;base64,{}", base64_encode(&bytes)));
-    (thumbnail, filmstrip)
+        .args(["-map", "0:v:0", "-frames:v", "1", "-vf", "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2", "-threads:v", "1", "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "pipe:1"])
+        .output().ok().filter(|result| result.status.success() && !result.stdout.is_empty())
+        .map(|result| format!("data:image/jpeg;base64,{}", base64_encode(&result.stdout)));
+    let filmstrip = Command::new(multimedia_binary("ffmpeg"))
+        .args(["-v", "error", "-threads", "1", "-i"])
+        .arg(path)
+        .args(["-vf"])
+        .arg(format!("fps={frame_rate},scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2,tile=layout=6x1:nb_frames=6:padding=0:margin=0"))
+        .args(["-frames:v", "1", "-threads:v", "1", "-f", "image2pipe", "-c:v", "png", "pipe:1"])
+        .output().ok().filter(|result| result.status.success() && !result.stdout.is_empty())
+        .map(|result| format!("data:image/png;base64,{}", base64_encode(&result.stdout)));
+    let filmstrip = filmstrip.or_else(|| thumbnail.clone());
+    (thumbnail.or_else(|| filmstrip.clone()), filmstrip)
 }
 
 fn ffmpeg_waveform_data(path: &Path) -> Option<String> {
@@ -706,9 +699,16 @@ fn render_timeline(app: tauri::AppHandle, process: SharedExport, clips: Vec<Valu
     let titles: Vec<_> = clips.iter().filter(|clip| clip["theme"].as_str() == Some("title")).collect();
     visual.sort_by(|a,b| a["track"].as_str().cmp(&b["track"].as_str()).then_with(|| n(a, "start", 0.0).partial_cmp(&n(b, "start", 0.0)).unwrap_or(std::cmp::Ordering::Equal)));
     let audio: Vec<_> = if include_audio { clips.iter().filter(|clip| {
-        clip["track"].as_str().map(|track| track.starts_with('a')).unwrap_or(false)
-            && clip["path"].as_str().is_some()
-            && (clip["mediaKind"].as_str() == Some("audio") || clip["hasAudio"].as_bool() == Some(true) || !clip["linkedAudioId"].is_null())
+        let Some(track) = clip["track"].as_str() else { return false; };
+        if clip["path"].as_str().is_none() { return false; }
+        if track.starts_with('a') { return true; }
+        if !track.starts_with('v') || clip["hasAudio"].as_bool() != Some(true)
+            || clip["audioDetached"].as_bool() == Some(true) || !clip["linkedAudioId"].is_null() { return false; }
+        let path = clip["path"].as_str().unwrap_or_default();
+        let start = n(clip, "start", 0.0);
+        !clips.iter().any(|candidate| candidate["track"].as_str().map(|lane| lane.starts_with('a')).unwrap_or(false)
+            && candidate["path"].as_str() == Some(path)
+            && (n(candidate, "start", 0.0) - start).abs() < 1.0 / 30.0)
     }).collect() } else { Vec::new() };
     let mut transition_ends_by_track: HashMap<String, Vec<(f64, usize, &Value)>> = HashMap::new();
     let mut visual_starts_by_track: HashMap<String, Vec<f64>> = HashMap::new();
